@@ -1,3 +1,8 @@
+#include "logcfg.h"   /* 必须第一行: 日志配置要在 <Arduino.h> 之前生效 */
+#include "strutil.h"  /* std::string 与 Arduino String 的桥接 */
+
+static const char *TAG = "voice";    // 日志标签
+
 #include "voice.h"
 #include "httpio.h"
 #include "med.h"
@@ -323,7 +328,12 @@ static void printWaveform(const int16_t *s, size_t n)
     if (n < (size_t)cols) return;
 
     const size_t step = n / cols;
-    Serial.print("    [");
+
+    /* 整行拼好再一次性输出 —— ESP_LOG 每条自成一行, 不能像 Serial.print
+       那样分几段"接着打"(那样会变成好几条独立日志, 波形就散了)。 */
+    char line[80];
+    int  p = 0;
+    line[p++] = '[';
     for (int c = 0; c < cols; c++) {
         uint32_t peak = 0;
         for (size_t i = 0; i < step; i++) {
@@ -333,9 +343,12 @@ static void printWaveform(const int16_t *s, size_t n)
         }
         int idx = (int)((uint64_t)peak * 9 / 32768);
         if (idx > 9) idx = 9;
-        Serial.print(bar[idx]);
+        line[p++] = bar[idx];
     }
-    Serial.println("]");
+    line[p++] = ']';
+    line[p]   = '\0';
+
+    ESP_LOGI(TAG, "%s", line);
 }
 
 /* ==================== 播放 ==================== */
@@ -344,12 +357,12 @@ static bool playWavBuffer(const uint8_t *wav, size_t len, bool interruptible)
 {
     WavInfo wi;
     if (!wavParse(wav, len, wi)) {
-        Serial.println("[VOICE] WAV 解析失败");
+        ESP_LOGI(TAG, "[VOICE] WAV 解析失败");
         return false;
     }
 
     const uint32_t bytesPerFrame = (wi.bits ? wi.bits / 8 : 2) * (wi.channels ? wi.channels : 1);
-    Serial.printf("[TTS] WAV: %u Hz, %u 声道, %u bit, 音频 %.1f 秒 (总 %u 字节)\n",
+    ESP_LOGI(TAG, "[TTS] WAV: %u Hz, %u 声道, %u bit, 音频 %.1f 秒 (总 %u 字节)",
                   (unsigned)wi.rate, (unsigned)wi.channels, (unsigned)wi.bits,
                   (double)wi.dataLen / ((double)wi.rate * bytesPerFrame),
                   (unsigned)len);
@@ -359,10 +372,10 @@ static bool playWavBuffer(const uint8_t *wav, size_t len, bool interruptible)
        那批 DMA 垃圾就会被直接放出来。 */
     ampOn(false);
     delay(10);
-    Serial.printf("[TTS] [%u ms] 功放已关断, 装 I2S\n", millis());
+    ESP_LOGI(TAG, "[TTS] [%u ms] 功放已关断, 装 I2S", millis());
 
     if (!i2sInstallTx(wi.rate)) {
-        Serial.println("[VOICE] I2S 播放模式安装失败");
+        ESP_LOGI(TAG, "[VOICE] I2S 播放模式安装失败");
         return false;
     }
 
@@ -382,13 +395,13 @@ static bool playWavBuffer(const uint8_t *wav, size_t len, bool interruptible)
             i2sWriteAll((const uint8_t *)silence, sizeof(silence));
             filled += sizeof(silence);
         }
-        Serial.printf("[TTS] [%u ms] 静音已灌 %u 字节 (环形缓冲只有 8KB)\n",
+        ESP_LOGI(TAG, "[TTS] [%u ms] 静音已灌 %u 字节 (环形缓冲只有 8KB)",
                       millis(), (unsigned)filled);
     }
 
     ampOn(true);            // ★ 缓冲填满静音之后才使能功放
     delay(10);
-    Serial.printf("[TTS] [%u ms] 功放已开, 开始播真实音频\n", millis());
+    ESP_LOGI(TAG, "[TTS] [%u ms] 功放已开, 开始播真实音频", millis());
 
     const uint8_t *pcm = wav + wi.dataOff;
     const size_t   n   = wi.dataLen;
@@ -415,7 +428,7 @@ static bool playWavBuffer(const uint8_t *wav, size_t len, bool interruptible)
 
             /* 播报中途按一下 BOOT 就能打断 —— 4~8 秒听着不能停会让人烦 */
             if (interruptible && gpio_get_level((gpio_num_t)VOICE_PIN_BOOT) == 0) {
-                Serial.println("[VOICE] 用户按键, 打断播报");
+                ESP_LOGI(TAG, "[VOICE] 用户按键, 打断播报");
                 break;
             }
         }
@@ -481,9 +494,9 @@ static bool testTone(uint32_t freq, uint32_t ms)
 
 /* ==================== ASR 上传 (multipart/form-data) ==================== */
 
-static String mpTextField(const char *name, const char *value)
+static std::string mpTextField(const char *name, const char *value)
 {
-    String s;
+    std::string s;
     s.reserve(strlen(name) + strlen(value) + 96);
     s += "--"; s += ASR_BOUNDARY; s += "\r\n";
     s += "Content-Disposition: form-data; name=\""; s += name; s += "\"\r\n\r\n";
@@ -492,10 +505,10 @@ static String mpTextField(const char *name, const char *value)
     return s;
 }
 
-/* file part 的头。真正的数据(44 字节 RIFF 头 + PCM)后面分两次发 */
-static String mpFileHead()
+/* file part 的头。真正的数据(64 字节 WAV 头 + PCM)后面分两次发 */
+static std::string mpFileHead()
 {
-    String s;
+    std::string s;
     s.reserve(160);
     s += "--"; s += ASR_BOUNDARY; s += "\r\n";
     s += "Content-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n";
@@ -503,9 +516,9 @@ static String mpFileHead()
     return s;
 }
 
-static String mpTail()
+static std::string mpTail()
 {
-    String s;
+    std::string s;
     s.reserve(64);
     s += "\r\n--"; s += ASR_BOUNDARY; s += "--\r\n";
     return s;
@@ -513,17 +526,17 @@ static String mpTail()
 
 /* 上传录音拿转写结果。
  * 用 file 分片而不是 file_base64: 省掉一份 427KB 的 base64 缓冲。 */
-static bool asrTranscribe(const uint8_t *recBuf, size_t pcmLen, String &outText)
+static bool asrTranscribe(const uint8_t *recBuf, size_t pcmLen, std::string &outText)
 {
-    outText = "";
+    outText.clear();
 
-    String prefix;
+    std::string prefix;
     prefix += mpTextField("model", ASR_MODEL);
     prefix += mpTextField("stream", "false");
     prefix += mpTextField("hotwords", ASR_HOTWORDS);
 
-    const String fileHead = mpFileHead();
-    const String tail     = mpTail();
+    const std::string fileHead = mpFileHead();
+    const std::string tail     = mpTail();
 
     /* file part 的内容 = 64 字节 WAV 头(含 JUNK 对齐块) + PCM。
        头本身就占满到 64, 中间没有要跳过的填充, 所以直接相加 */
@@ -537,7 +550,7 @@ static bool asrTranscribe(const uint8_t *recBuf, size_t pcmLen, String &outText)
     WiFiClientSecure client;
     ui("ASR upload...", nullptr, -1);
     if (!httpConnect(client, ZHIPU_HOST, 443, TLS_TIMEOUT_S)) {
-        Serial.println("[ASR] TLS 连接失败");
+        ESP_LOGI(TAG, "[ASR] TLS 连接失败");
         return false;
     }
 
@@ -567,32 +580,33 @@ static bool asrTranscribe(const uint8_t *recBuf, size_t pcmLen, String &outText)
     wr((const uint8_t *)tail.c_str(),     tail.length());
 
     if (!ok) {
-        Serial.printf("[ASR] 请求体写到一半断了 (已发 %u / %u 字节)\n",
+        ESP_LOGI(TAG, "[ASR] 请求体写到一半断了 (已发 %u / %u 字节)",
                       (unsigned)sent, (unsigned)bodyLen);
         return false;
     }
-    Serial.printf("[ASR] 请求体 %u 字节 (预期 %u) %s\n",
+    ESP_LOGI(TAG, "[ASR] 请求体 %u 字节 (预期 %u) %s",
                   (unsigned)sent, (unsigned)bodyLen,
                   sent == bodyLen ? "一致" : "!! 不一致, 服务端多半会挂起");
 
     bool chunked = false;
     const int code = httpReadHeader(client, chunked);
-    String body = httpReadBody(client, 30000);
+    std::string body = httpReadBody(client, 30000);
     if (chunked) body = httpDecodeChunked(body);
 
     if (code != 200) {
-        Serial.printf("[ASR] HTTP %d\n", code);
-        Serial.println(body.substring(0, 512));
+        ESP_LOGE(TAG, "[ASR] HTTP %d", code);
+        ESP_LOGE(TAG, "%s", strSub(body, 0, 512).c_str());
         return false;
     }
 
     /* ⚠️ 转写文字在**顶层 text**, 不是 choices[0].message.content。
        用 httpExtractContent() 取的话会永远得到空串, 而且不报任何错。 */
     outText = httpExtractStringField(body, "text");
-    Serial.printf("[ASR] 转写: 「%s」\n", outText.c_str());
-    if (outText.isEmpty())
-        Serial.println("[ASR] 没取到 text 字段, 原始响应: " + body.substring(0, 512));
-    return !outText.isEmpty();
+    ESP_LOGI(TAG, "[ASR] 转写: 「%s」", outText.c_str());
+    if (outText.empty())
+        ESP_LOGW(TAG, "[ASR] 没取到 text 字段, 原始响应: %s",
+                 strSub(body, 0, 512).c_str());
+    return !outText.empty();
 }
 
 /* ==================== TTS ==================== */
@@ -641,14 +655,15 @@ static size_t readChunkedToBuffer(WiFiClientSecure &c, uint8_t *dst, size_t cap,
             continue;
         }
 
-        String line = c.readStringUntil('\n');           // chunk 长度行, 纯 ASCII
-        line.trim();
+        /* Stream::readStringUntil 返回的就是 Arduino String —— 边界处过桥 */
+        std::string line = toStd(c.readStringUntil('\n'));   // chunk 长度行, 纯 ASCII
+        strTrim(line);
         const long sz = strtol(line.c_str(), nullptr, 16);
         if (sz <= 0) break;                              // 0 = 结束块
 
         chunks++;
         if (chunks <= 4)                                 // 只报前几个, 免得刷屏
-            Serial.printf("[TTS] chunk#%d %ld 字节 (累计 %u)\n",
+            ESP_LOGI(TAG, "[TTS] chunk#%d %ld 字节 (累计 %u)",
                           chunks, sz, (unsigned)out);
 
         size_t got = 0;
@@ -670,7 +685,7 @@ static size_t readChunkedToBuffer(WiFiClientSecure &c, uint8_t *dst, size_t cap,
         c.readStringUntil('\n');                         // 块尾的 \r\n
     }
 
-    Serial.printf("[TTS] chunked 解出 %u 字节, 共 %d 块%s\n",
+    ESP_LOGI(TAG, "[TTS] chunked 解出 %u 字节, 共 %d 块%s",
                   (unsigned)out, chunks, timedOut ? " (超时退出!)" : "");
     return out;
 }
@@ -679,18 +694,18 @@ static size_t readChunkedToBuffer(WiFiClientSecure &c, uint8_t *dst, size_t cap,
  * 免责是药品场景的安全边界 —— 输出要是"陈述 + 免责", 不是指令。
  * 但它只对用药提醒有意义: 测试语句、纯记录类("已记下这次服用")跟一句
  * "请以医嘱为准"听着莫名其妙。所以由调用方决定, 不在这里无差别追加。 */
-static String speakTextFrom(const char *reply, bool addDisclaimer)
+static std::string speakTextFrom(const char *reply, bool addDisclaimer)
 {
-    String s(reply);
-    s.trim();
-    if (s.isEmpty()) return s;
+    std::string s(reply ? reply : "");
+    strTrim(s);
+    if (s.empty()) return s;
 
     /* 太长截断。UTF-8 中文一字 3 字节, 按字节截可能截出半个汉字, 往前退到完整字符 */
-    const int maxBytes = TTS_MAX_CHARS * 3;
-    if ((int)s.length() > maxBytes) {
-        int cut = maxBytes;
+    const size_t maxBytes = (size_t)TTS_MAX_CHARS * 3;
+    if (s.size() > maxBytes) {
+        size_t cut = maxBytes;
         while (cut > 0 && ((uint8_t)s[cut] & 0xC0) == 0x80) cut--;
-        s = s.substring(0, cut);
+        s = s.substr(0, cut);
     }
 
     if (addDisclaimer) s += "。以上仅供参考，请以医嘱和说明书为准。";
@@ -701,49 +716,49 @@ static bool ttsSpeak(const char *reply, bool addDisclaimer)
 {
     if (!reply || !*reply) return true;
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[TTS] WiFi 没连, 跳过播报");
+        ESP_LOGI(TAG, "[TTS] WiFi 没连, 跳过播报");
         return false;
     }
     if (!s_ttsBuf) return false;
 
-    const String say  = speakTextFrom(reply, addDisclaimer);
-    String body = "{\"model\":\"" TTS_MODEL "\",\"input\":\"";
+    const std::string say  = speakTextFrom(reply, addDisclaimer);
+    std::string body = "{\"model\":\"" TTS_MODEL "\",\"input\":\"";
     body += httpJsonEscape(say.c_str());
     body += "\",\"voice\":\"" TTS_VOICE "\",\"response_format\":\"wav\",\"speed\":1.0}";
 
     WiFiClientSecure client;
-    Serial.printf("[TTS] 文本 %u 字节, 请求体 %u 字节\n",
-                  (unsigned)say.length(), (unsigned)body.length());
+    ESP_LOGI(TAG, "[TTS] 文本 %u 字节, 请求体 %u 字节",
+                  (unsigned)say.size(), (unsigned)body.size());
     ui("Speaking...", nullptr, -1);
 
-    Serial.println("[TTS] TLS 连接中...");
+    ESP_LOGI(TAG, "[TTS] TLS 连接中...");
     if (!httpConnect(client, ZHIPU_HOST, 443, TLS_TIMEOUT_S)) {
-        Serial.println("[TTS] TLS 连接失败");
+        ESP_LOGI(TAG, "[TTS] TLS 连接失败");
         return false;
     }
-    Serial.println("[TTS] TLS 已建立");
+    ESP_LOGI(TAG, "[TTS] TLS 已建立");
 
     client.printf("POST %s HTTP/1.1\r\n", TTS_PATH);
     client.printf("Host: %s\r\n", ZHIPU_HOST);
     client.printf("Authorization: Bearer %s\r\n", ZHIPU_API_KEY);
     client.print("Content-Type: application/json\r\n");
-    client.printf("Content-Length: %u\r\n", (unsigned)body.length());
+    client.printf("Content-Length: %u\r\n", (unsigned)body.size());
     client.print("Connection: close\r\n\r\n");
 
-    if (!httpWriteAll(client, (const uint8_t *)body.c_str(), body.length())) {
-        Serial.println("[TTS] 请求体发送失败");
+    if (!httpWriteAll(client, (const uint8_t *)body.c_str(), body.size())) {
+        ESP_LOGI(TAG, "[TTS] 请求体发送失败");
         return false;
     }
-    Serial.println("[TTS] 请求已发出, 等响应头 (最长 90 秒)...");
+    ESP_LOGI(TAG, "[TTS] 请求已发出, 等响应头 (最长 90 秒)...");
 
     bool chunked = false;
     const int code = httpReadHeader(client, chunked);
-    Serial.printf("[TTS] 响应码 %d, chunked=%d\n", code, (int)chunked);
+    ESP_LOGI(TAG, "[TTS] 响应码 %d, chunked=%d", code, (int)chunked);
 
     if (code != 200) {
-        String err = httpReadBody(client, 10000);
+        std::string err = httpReadBody(client, 10000);
         if (chunked) err = httpDecodeChunked(err);
-        Serial.printf("[TTS] HTTP %d: %s\n", code, err.substring(0, 256).c_str());
+        ESP_LOGE(TAG, "[TTS] HTTP %d: %s", code, strSub(err, 0, 256).c_str());
         return false;
     }
 
@@ -752,7 +767,7 @@ static bool ttsSpeak(const char *reply, bool addDisclaimer)
         : readRawToBuffer(client, s_ttsBuf, TTS_BUF_BYTES, 30000);
 
     if (total < 44) {
-        Serial.printf("[TTS] 响应只有 %u 字节\n", (unsigned)total);
+        ESP_LOGI(TAG, "[TTS] 响应只有 %u 字节", (unsigned)total);
         return false;
     }
 
@@ -761,7 +776,7 @@ static bool ttsSpeak(const char *reply, bool addDisclaimer)
     if (memcmp(s_ttsBuf, "RIFF", 4) != 0) {
         const size_t dbg = total < 200 ? total : 200;
         s_ttsBuf[dbg] = 0;
-        Serial.printf("[TTS] 不是 WAV, 开头是: %s\n", (const char *)s_ttsBuf);
+        ESP_LOGI(TAG, "[TTS] 不是 WAV, 开头是: %s", (const char *)s_ttsBuf);
         return false;
     }
 
@@ -808,7 +823,7 @@ static void recordAndHandle()
     ampOn(false);
 
     if (!i2sInstallRx()) {
-        Serial.println("[VOICE] I2S 录音模式安装失败");
+        ESP_LOGI(TAG, "[VOICE] I2S 录音模式安装失败");
         ui("Mic FAIL", "i2s install", -1);
         s_state = VS_IDLE;
         return;
@@ -826,7 +841,7 @@ static void recordAndHandle()
         size_t got = 0;
         if (i2s_read(I2S_NUM_0, s_recBuf + VOICE_PCM_OFF + s_recPcmLen, want, &got,
                      pdMS_TO_TICKS(500)) != ESP_OK) {
-            Serial.println("[VOICE] i2s_read 出错");
+            ESP_LOGI(TAG, "[VOICE] i2s_read 出错");
             break;
         }
         if (got) {
@@ -850,11 +865,11 @@ static void recordAndHandle()
     i2sUninstall();
 
     const double secs = (double)s_recPcmLen / (VOICE_RATE_HZ * 2);
-    Serial.printf("[VOICE] 录到 %u 字节 (%.1f 秒), 峰值 %u\n",
+    ESP_LOGI(TAG, "[VOICE] 录到 %u 字节 (%.1f 秒), 峰值 %u",
                   (unsigned)s_recPcmLen, secs, (unsigned)s_peak);
 
     if (s_recPcmLen < (size_t)VOICE_RATE_HZ) {       // < 0.5 秒 = 误触
-        Serial.println("[VOICE] 太短, 忽略");
+        ESP_LOGI(TAG, "[VOICE] 太短, 忽略");
         ui("Too short", nullptr, -1);
         s_state = VS_IDLE;
         return;
@@ -867,8 +882,8 @@ static void recordAndHandle()
                           (s_nonZeroCnt * 100 < (s_nonZeroCnt + s_zeroCnt));
 
     if (lineDead) {
-        Serial.println("[VOICE] 麦克风数据线没有输出(整段恒定或全 0)");
-        Serial.println("        查: L/R 是否接了 GND / VDD 是否 3V3 / SD 是否在 GPIO40");
+        ESP_LOGI(TAG, "[VOICE] 麦克风数据线没有输出(整段恒定或全 0)");
+        ESP_LOGI(TAG, "        查: L/R 是否接了 GND / VDD 是否 3V3 / SD 是否在 GPIO40");
         ui("Mic DEAD", "check wiring", -1);
         publishResult(false, "", "麦克风没有输出。检查接线：L/R 接 GND，VDD 接 3V3，SD 接 GPIO40。");
         s_state = VS_IDLE;
@@ -878,7 +893,7 @@ static void recordAndHandle()
     if (s_peak < VOICE_SILENT_PEAK) {
         /* 有数据但全是底噪。拦下来: 不浪费一次 API 调用,
            也免得人以为是"识别不准"而去调 prompt */
-        Serial.printf("[VOICE] 整段几乎没有声音 (峰值 %u)\n", (unsigned)s_peak);
+        ESP_LOGI(TAG, "[VOICE] 整段几乎没有声音 (峰值 %u)", (unsigned)s_peak);
         ui("No sound", "speak louder", -1);
         publishResult(false, "", "没听到声音，请靠近麦克风再说一次。");
         s_state = VS_IDLE;
@@ -889,9 +904,9 @@ static void recordAndHandle()
 
     /* ---- ASR ---- */
     s_state = VS_UPLOAD;
-    String text;
+    std::string text;
     if (!asrTranscribe(s_recBuf, s_recPcmLen, text)) {
-        Serial.println("[VOICE] ASR 失败");
+        ESP_LOGI(TAG, "[VOICE] ASR 失败");
         ui("ASR failed", "see serial", -1);
         publishResult(false, "", "语音识别失败，看串口日志。");
         s_state = VS_IDLE;
@@ -901,8 +916,8 @@ static void recordAndHandle()
     /* ---- 本地判断 ----
        复用已有的处理链路: 和网页文本框 POST /say 是同一个函数,
        所以「记录服药 / 记方案 / 查询该怎么吃」三种说法在这里全都能用 */
-    const String reply = medHandleUtterance(text.c_str());
-    Serial.printf("[VOICE] 「%s」-> %s\n", text.c_str(), reply.c_str());
+    const std::string reply = medHandleUtterance(text.c_str());
+    ESP_LOGI(TAG, "[VOICE] 「%s」-> %s", text.c_str(), reply.c_str());
 
     /* 先存(网页可能正在读), 播报完再上屏 —— 否则结果页会被
        ttsSpeak 里的 "Speaking..." 提示覆盖掉, 最后停在提示页上没意义 */
@@ -963,7 +978,7 @@ bool voiceBegin(VoiceUiCb ui)
     s_recBuf = (uint8_t *)heap_caps_aligned_alloc(16, recBytes, MALLOC_CAP_SPIRAM);
     s_ttsBuf = (uint8_t *)heap_caps_aligned_alloc(16, TTS_BUF_BYTES + 1, MALLOC_CAP_SPIRAM);
     if (!s_recBuf || !s_ttsBuf) {
-        Serial.printf("[VOICE] PSRAM 缓冲分配失败 (录音 %u KB / 播放 %u KB)\n",
+        ESP_LOGI(TAG, "[VOICE] PSRAM 缓冲分配失败 (录音 %u KB / 播放 %u KB)",
                       (unsigned)(recBytes / 1024), (unsigned)(TTS_BUF_BYTES / 1024));
         return false;
     }
@@ -980,7 +995,7 @@ bool voiceBegin(VoiceUiCb ui)
 
     s_sem = xSemaphoreCreateBinary();
     if (!s_sem) {
-        Serial.println("[VOICE] 信号量创建失败");
+        ESP_LOGI(TAG, "[VOICE] 信号量创建失败");
         return false;
     }
 
@@ -988,11 +1003,11 @@ bool voiceBegin(VoiceUiCb ui)
        远低于 WiFi 的 ~23, 只在语音会话那几秒真正占用。
        栈给 8192: TLS 握手的调用链很深。 */
     if (xTaskCreatePinnedToCore(voiceTask, "voice", 8192, nullptr, 3, nullptr, 1) != pdPASS) {
-        Serial.println("[VOICE] 语音 task 创建失败");
+        ESP_LOGI(TAG, "[VOICE] 语音 task 创建失败");
         return false;
     }
 
-    Serial.printf("[VOICE] 就绪: 录音缓冲 %u KB, 播放缓冲 %u KB (PSRAM)\n",
+    ESP_LOGI(TAG, "[VOICE] 就绪: 录音缓冲 %u KB, 播放缓冲 %u KB (PSRAM)",
                   (unsigned)(recBytes / 1024), (unsigned)(TTS_BUF_BYTES / 1024));
     return true;
 }
@@ -1039,45 +1054,45 @@ void voiceSetResultCb(VoiceResultCb cb) { s_resultCb = cb; }
 
 void voiceSelfTest()
 {
-    Serial.println();
-    Serial.println("========== 麦克风 / 功放 自检 ==========");
-    Serial.println("接线: INMP441   VDD=3V3 GND=GND SCK=41 WS=42 SD=40 L/R=GND");
-    Serial.println("      MAX98357A VIN=5V  BCLK=41 LRC=42 DIN=39 SD=38 SPK±=喇叭");
-    Serial.println();
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "========== 麦克风 / 功放 自检 ==========");
+    ESP_LOGI(TAG, "接线: INMP441   VDD=3V3 GND=GND SCK=41 WS=42 SD=40 L/R=GND");
+    ESP_LOGI(TAG, "      MAX98357A VIN=5V  BCLK=41 LRC=42 DIN=39 SD=38 SPK±=喇叭");
+    ESP_LOGI(TAG, "");
 
     if (!s_recBuf) {
-        Serial.println("[自检] 录音缓冲没分配 —— 要先调 voiceBegin()");
+        ESP_LOGI(TAG, "[自检] 录音缓冲没分配 —— 要先调 voiceBegin()");
         for (;;) delay(1000);
     }
 
     /* ---- ① 先验功放 ----
        麦克风和功放是两个独立模块, 分开验才定位得了问题。先验功放是因为
        它只有一条路(生成波形 -> I2S -> 喇叭), 变量最少。 */
-    Serial.println("[自检 ①] 放 1kHz 测试音 1 秒 —— 应该听到「嘀」的一声");
+    ESP_LOGI(TAG, "[自检 ①] 放 1kHz 测试音 1 秒 —— 应该听到「嘀」的一声");
     if (testTone(1000, 1000)) {
-        Serial.println("        已播放。没声音就是**功放侧**的问题, 检查:");
-        Serial.println("          VIN 是不是 5V / SD(GPIO38) 有没有接到模块的 SD/EN");
-        Serial.println("          SPK± 是不是接在喇叭两端(都不能接 GND —— 会烧功放)");
+        ESP_LOGI(TAG, "        已播放。没声音就是**功放侧**的问题, 检查:");
+        ESP_LOGI(TAG, "          VIN 是不是 5V / SD(GPIO38) 有没有接到模块的 SD/EN");
+        ESP_LOGI(TAG, "          SPK± 是不是接在喇叭两端(都不能接 GND —— 会烧功放)");
     } else {
-        Serial.println("        !! I2S 播放模式安装失败");
+        ESP_LOGI(TAG, "        !! I2S 播放模式安装失败");
     }
 
     delay(1200);
 
     /* ---- ② 录音 + ③ 回放, 循环 ---- */
-    Serial.println();
-    Serial.println("[自检 ②] 按住 BOOT 说话, 松手结束。会打波形, 然后用喇叭回放出来。");
-    Serial.println("        退出自检: 把 voice.h 的 MIC_SELFTEST 改成 0 重新烧录");
-    Serial.println();
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "[自检 ②] 按住 BOOT 说话, 松手结束。会打波形, 然后用喇叭回放出来。");
+    ESP_LOGI(TAG, "        退出自检: 把 voice.h 的 MIC_SELFTEST 改成 0 重新烧录");
+    ESP_LOGI(TAG, "");
 
     for (;;) {
         while (gpio_get_level((gpio_num_t)VOICE_PIN_BOOT) != 0) delay(20);   // 等按下
         delay(30);                                                          // 消抖
 
-        Serial.println("[自检] 录音中... 松手结束");
+        ESP_LOGI(TAG, "[自检] 录音中... 松手结束");
         ampOn(false);                       // 录音期间关功放(自激)
         if (!i2sInstallRx()) {
-            Serial.println("[自检] !! I2S 录音模式安装失败");
+            ESP_LOGI(TAG, "[自检] !! I2S 录音模式安装失败");
             while (gpio_get_level((gpio_num_t)VOICE_PIN_BOOT) == 0) delay(20);
             continue;
         }
@@ -1106,15 +1121,15 @@ void voiceSelfTest()
         /* 等松手 —— 否则回放期间还按着的手会被当成下一次录音 */
         while (gpio_get_level((gpio_num_t)VOICE_PIN_BOOT) == 0) delay(20);
 
-        Serial.printf("[自检] 录到 %u 字节 (%.1f 秒), 峰值 %u, 范围 [%d, %d], 非零 %u/%u\n",
+        ESP_LOGI(TAG, "[自检] 录到 %u 字节 (%.1f 秒), 峰值 %u, 范围 [%d, %d], 非零 %u/%u",
                       (unsigned)s_recPcmLen,
                       (double)s_recPcmLen / (VOICE_RATE_HZ * 2),
                       (unsigned)s_peak, (int)s_minVal, (int)s_maxVal,
                       (unsigned)s_nonZeroCnt, (unsigned)(s_nonZeroCnt + s_zeroCnt));
-        Serial.println("        (整段范围不跳 / 非零占比极低 = 数据线没输出)");
+        ESP_LOGI(TAG, "        (整段范围不跳 / 非零占比极低 = 数据线没输出)");
 
         if (s_recPcmLen < (size_t)VOICE_RATE_HZ) {
-            Serial.println("        太短, 忽略\n");
+            ESP_LOGI(TAG, "        太短, 忽略");
             continue;
         }
 
@@ -1123,11 +1138,11 @@ void voiceSelfTest()
         /* 录完立刻回放 —— 有声音就说明录音和播放两条路都通了。
            听音高: 明显低沉/时长翻倍 = 采样率配置不对(16k 录的按别的速率放的)。 */
         wavWriteHeader(s_recBuf, s_recPcmLen);
-        Serial.println("[自检] 回放:");
+        ESP_LOGI(TAG, "[自检] 回放:");
         if (!playWavBuffer(s_recBuf, VOICE_WAV_HDR + s_recPcmLen, false)) {
-            Serial.println("        !! 回放失败");
+            ESP_LOGI(TAG, "        !! 回放失败");
         }
 
-        Serial.println("\n------ 准备好就再按一次 BOOT ------\n");
+        ESP_LOGI(TAG, "\n------ 准备好就再按一次 BOOT ------");
     }
 }

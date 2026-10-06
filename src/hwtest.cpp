@@ -1,3 +1,7 @@
+#include "logcfg.h"   /* 必须第一行: 日志配置要在 <Arduino.h> 之前生效 */
+
+static const char *TAG = "hwtest";    // 日志标签
+
 #include "hwtest.h"
 #include "cnfont.h"
 
@@ -74,8 +78,8 @@ static void probePins()
         { HT_PIN_AMP_SD,  "AMP_SD  (38)" },
     };
 
-    Serial.println("\n[HW ⓪] 引脚静态电平探测");
-    Serial.println("        (上拉/下拉各读一次; 两次不同=悬空正常, 相同=被外部钉死)");
+    ESP_LOGI(TAG, "\n[HW ⓪] 引脚静态电平探测");
+    ESP_LOGI(TAG, "        (上拉/下拉各读一次; 两次不同=悬空正常, 相同=被外部钉死)");
 
     for (auto &e : list) {
         gpio_config_t c = {};
@@ -99,7 +103,7 @@ static void probePins()
         else if (up == 0)      verdict = "!! 被钉在低电平 —— 短路到 GND 或接错脚了";
         else                   verdict = "!! 被钉在高电平 —— 接到 VCC 或接错脚了";
 
-        Serial.printf("        %-12s 上拉=%d 下拉=%d  ->  %s\n", e.name, up, dn, verdict);
+        ESP_LOGI(TAG, "        %-12s 上拉=%d 下拉=%d  ->  %s", e.name, up, dn, verdict);
     }
 
     /* 探测完把脚恢复成输入, 后面装 I2S 时会重新配置 */
@@ -110,7 +114,7 @@ static void probePins()
         gpio_config(&c);
     }
     ampInit();      // AMP_SD 要恢复成输出, 否则功放使能脚悬空
-    Serial.println();
+    ESP_LOGI(TAG, "");
 }
 
 /* ==================== I2S 开/关 ==================== */
@@ -194,12 +198,12 @@ static void testScreen(Adafruit_GFX &g)
     const int W = g.width();
     const int H = g.height();
 
-    Serial.println("\n[HW ①] 屏幕 —— 依次画 5 张图, 每张停几秒");
-    Serial.printf("        尺寸 %dx%d\n", W, H);
+    ESP_LOGI(TAG, "\n[HW ①] 屏幕 —— 依次画 5 张图, 每张停几秒");
+    ESP_LOGI(TAG, "        尺寸 %dx%d", W, H);
 
     /* [a] 纯色慢闪 —— 每色 500ms 走两轮。
          屏幕有故障时这几帧是唯一的"活体证据", 给慢了才看得清。 */
-    Serial.println("        [a] 纯色闪光: 红/绿/蓝/白 各 0.5 秒, 走 2 轮");
+    ESP_LOGI(TAG, "        [a] 纯色闪光: 红/绿/蓝/白 各 0.5 秒, 走 2 轮");
     const uint16_t sweep[] = { C_RED, C_GREEN, C_BLUE, C_WHITE };
     for (int round = 0; round < 2; round++) {
         for (uint16_t c : sweep) {
@@ -209,7 +213,7 @@ static void testScreen(Adafruit_GFX &g)
     }
 
     /* [b] 彩条 —— 看颜色顺序对不对(红绿蓝白黄青品黑) */
-    Serial.println("        [b] 彩条: 红绿蓝白黄青品黑");
+    ESP_LOGI(TAG, "        [b] 彩条: 红绿蓝白黄青品黑");
     {
         const uint16_t bars[] = { C_RED, C_GREEN, C_BLUE, C_WHITE, C_YELLOW, C_CYAN, 0xF81F, C_BLACK };
         for (int i = 0; i < 8; i++)
@@ -218,7 +222,7 @@ static void testScreen(Adafruit_GFX &g)
     delay(3000);
 
     /* [c] 棋盘格 —— 看有没有缺行/缺列(线松的典型症状) */
-    Serial.println("        [c] 棋盘格: 看有没有缺行/缺列");
+    ESP_LOGI(TAG, "        [c] 棋盘格: 看有没有缺行/缺列");
     {
         const int cell = 16;
         for (int y = 0; y < H; y += cell)
@@ -228,7 +232,7 @@ static void testScreen(Adafruit_GFX &g)
     delay(3000);
 
     /* [d] 边框 + 十字 + 四角色块 —— 看整体有没有偏移/缩放 */
-    Serial.println("        [d] 边框+十字+四角: 红左上/绿右上/蓝左下/白右下");
+    ESP_LOGI(TAG, "        [d] 边框+十字+四角: 红左上/绿右上/蓝左下/白右下");
     g.fillScreen(C_BLACK);
     g.drawRect(0, 0, W, H, C_WHITE);
     g.drawFastHLine(0, H / 2, W, C_GREEN);
@@ -240,7 +244,7 @@ static void testScreen(Adafruit_GFX &g)
     delay(3000);
 
     /* [e] 文字页 —— 中文走点阵字库, 能画出来说明 cnfont 也正常 */
-    Serial.println("        [e] 文字页: 中英文");
+    ESP_LOGI(TAG, "        [e] 文字页: 中英文");
     g.fillScreen(C_BG);
     g.setTextColor(C_TEXT, C_BG);
     g.setTextSize(1);
@@ -251,12 +255,12 @@ static void testScreen(Adafruit_GFX &g)
     cnDraw(g, 4, 84, "屏幕就是好的", C_YELLOW);
     delay(3000);
 
-    Serial.println("        判读:");
-    Serial.println("          五张里任何一张看得到  -> 屏幕和 SPI 线是通的");
-    Serial.println("          全白/全黑/毫无变化      -> 屏幕侧没通");
-    Serial.println("            查 VCC=5V(不是3V3!) / GND / SCLK=21 / SDA=14 / CS=47 / DC=48 / RES=1");
-    Serial.println("          有图案但缺行缺列/偏移  -> 某根信号线接触不良");
-    Serial.println("          颜色顺序不对            -> 面板 tab 不对(TFT_TAB)");
+    ESP_LOGI(TAG, "        判读:");
+    ESP_LOGI(TAG, "          五张里任何一张看得到  -> 屏幕和 SPI 线是通的");
+    ESP_LOGI(TAG, "          全白/全黑/毫无变化      -> 屏幕侧没通");
+    ESP_LOGI(TAG, "            查 VCC=5V(不是3V3!) / GND / SCLK=21 / SDA=14 / CS=47 / DC=48 / RES=1");
+    ESP_LOGI(TAG, "          有图案但缺行缺列/偏移  -> 某根信号线接触不良");
+    ESP_LOGI(TAG, "          颜色顺序不对            -> 面板 tab 不对(TFT_TAB)");
 }
 
 /* ==================== ② 功放 ==================== */
@@ -265,10 +269,10 @@ static bool testSpeaker(Adafruit_GFX &g)
 {
     const uint32_t rate = 24000;
 
-    Serial.println("\n[HW ②] 功放 —— 放 1kHz 测试音 1 秒");
+    ESP_LOGI(TAG, "\n[HW ②] 功放 —— 放 1kHz 测试音 1 秒");
 
     if (!i2sTxOn(rate)) {
-        Serial.println("       !! I2S 播放模式装不上");
+        ESP_LOGI(TAG, "       !! I2S 播放模式装不上");
         return false;
     }
 
@@ -310,9 +314,9 @@ static bool testSpeaker(Adafruit_GFX &g)
     ampOn(false);
     i2s_driver_uninstall(I2S_NUM_0);
 
-    Serial.println("       听到「嘀」= 功放通过");
-    Serial.println("       没声音查: VIN 是不是 5V / SD(GPIO38) 有没有接到模块的 SD|EN");
-    Serial.println("                 SPK± 是不是接在喇叭两端(都不能接 GND)");
+    ESP_LOGI(TAG, "       听到「嘀」= 功放通过");
+    ESP_LOGI(TAG, "       没声音查: VIN 是不是 5V / SD(GPIO38) 有没有接到模块的 SD|EN");
+    ESP_LOGI(TAG, "                 SPK± 是不是接在喇叭两端(都不能接 GND)");
     return true;
 }
 
@@ -323,19 +327,19 @@ static void testMicWave(Adafruit_GFX &g)
     const int W = g.width();
     const int H = g.height();
 
-    Serial.println("\n[HW ③] 麦克风 —— 屏幕上实时画声波");
-    Serial.println("        对着麦克风说话, 波形应该跟着动。不用按键。");
-    Serial.println("        串口每秒一行, 判读方法:");
-    Serial.println("          全0 占绝大多数   -> 数据线没信号(没接 / SD 接错脚 / VDD 没供电)");
-    Serial.println("          全FF 占绝大多数  -> 数据线被拉高(接错到 VCC 或 SD 短路到 3V3)");
-    Serial.println("          其他值占多数     -> 有数据流; 再看说话时 rms 会不会变大");
-    Serial.println("          rms 随说话变大   -> 麦克风正常");
-    Serial.println("        ⚠ 读数是恒定的 全0 或 全FF 时, 先怀疑接线(接触不良/插错排针),");
-    Serial.println("          再怀疑硬件 —— 两者症状完全一样。重插一遍是最快的验证。");
+    ESP_LOGI(TAG, "\n[HW ③] 麦克风 —— 屏幕上实时画声波");
+    ESP_LOGI(TAG, "        对着麦克风说话, 波形应该跟着动。不用按键。");
+    ESP_LOGI(TAG, "        串口每秒一行, 判读方法:");
+    ESP_LOGI(TAG, "          全0 占绝大多数   -> 数据线没信号(没接 / SD 接错脚 / VDD 没供电)");
+    ESP_LOGI(TAG, "          全FF 占绝大多数  -> 数据线被拉高(接错到 VCC 或 SD 短路到 3V3)");
+    ESP_LOGI(TAG, "          其他值占多数     -> 有数据流; 再看说话时 rms 会不会变大");
+    ESP_LOGI(TAG, "          rms 随说话变大   -> 麦克风正常");
+    ESP_LOGI(TAG, "        ⚠ 读数是恒定的 全0 或 全FF 时, 先怀疑接线(接触不良/插错排针),");
+    ESP_LOGI(TAG, "          再怀疑硬件 —— 两者症状完全一样。重插一遍是最快的验证。");
 
     uint8_t *buf = (uint8_t *)heap_caps_malloc(HT_BLOCK_BYTES, MALLOC_CAP_SPIRAM);
     if (!buf) {
-        Serial.println("       !! PSRAM 分配失败");
+        ESP_LOGI(TAG, "       !! PSRAM 分配失败");
         g.fillScreen(C_BG);
         g.setTextColor(C_RED, C_BG);
         g.setCursor(4, 4);
@@ -345,7 +349,7 @@ static void testMicWave(Adafruit_GFX &g)
 
     ampOn(false);                   // ★ 录音期间必须关功放, 否则自激
     if (!i2sRxOn(I2S_CHANNEL_FMT_ONLY_LEFT)) {
-        Serial.println("       !! I2S 录音模式装不上");
+        ESP_LOGI(TAG, "       !! I2S 录音模式装不上");
         g.fillScreen(C_BG);
         g.setTextColor(C_RED, C_BG);
         g.setCursor(4, 4);
@@ -483,10 +487,10 @@ static void testMicWave(Adafruit_GFX &g)
                     else                    cntOther++;
                 }
 
-                Serial.printf("[HW] rms=%5u peak=%5u | 全0=%4d 全FF=%4d 其他=%4d | 开头:",
+                ESP_LOGI(TAG, "[HW] rms=%5u peak=%5u | 全0=%4d 全FF=%4d 其他=%4d | 开头:",
                               (unsigned)rms, (unsigned)peakHold, cntZero, cntFF, cntOther);
-                for (int i = 0; i < 6 && i < n; i++) Serial.printf(" %04X", (uint16_t)src[i]);
-                Serial.println();
+                for (int i = 0; i < 6 && i < n; i++) ESP_LOGI(TAG, " %04X", (uint16_t)src[i]);
+                ESP_LOGI(TAG, "");
             }
         }
 
@@ -499,9 +503,9 @@ static void testMicWave(Adafruit_GFX &g)
             g.setCursor(2, barY + barH + 4);
             g.print("NO SIGNAL - check wiring");
 
-            Serial.println("[HW] ⚠ 录了 8 秒没收到任何信号 —— 查:");
-            Serial.println("        L/R 有没有接 GND / VDD 是不是 3V3 / SD 是不是在 GPIO40");
-            Serial.println("        (INMP441 悬空 L/R 时读数会乱跳, 完全没接则恒定不变)");
+            ESP_LOGI(TAG, "[HW] ⚠ 录了 8 秒没收到任何信号 —— 查:");
+            ESP_LOGI(TAG, "        L/R 有没有接 GND / VDD 是不是 3V3 / SD 是不是在 GPIO40");
+            ESP_LOGI(TAG, "        (INMP441 悬空 L/R 时读数会乱跳, 完全没接则恒定不变)");
         }
     }
 }
@@ -510,16 +514,16 @@ static void testMicWave(Adafruit_GFX &g)
 
 void hwTestRun(Adafruit_GFX &g)
 {
-    Serial.println("\n\n==================================================");
-    Serial.println("  硬件诊断 (HW_TEST)");
-    Serial.println();
-    Serial.println("  接线核对表:");
-    Serial.println("    INMP441   VDD=3V3(!) GND=GND SCK=41 WS=42 SD=40 L/R=GND");
-    Serial.println("    MAX98357A VIN=5V     GND=GND BCLK=41 LRC=42 DIN=39 SD=38 SPK±=喇叭");
-    Serial.println("    ST7735S   VCC=5V(!)  GND=GND SCL=21 SDA=14 RES=1 DC=48 CS=47 BLK=2");
-    Serial.println();
-    Serial.println("  ⚠ 两个模块的电源别接混: 屏幕要 5V(板载LDO), 麦克风只能 3V3(接5V会烧)");
-    Serial.println("==================================================");
+    ESP_LOGI(TAG, "\n\n==================================================");
+    ESP_LOGI(TAG, "  硬件诊断 (HW_TEST)");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "  接线核对表:");
+    ESP_LOGI(TAG, "    INMP441   VDD=3V3(!) GND=GND SCK=41 WS=42 SD=40 L/R=GND");
+    ESP_LOGI(TAG, "    MAX98357A VIN=5V     GND=GND BCLK=41 LRC=42 DIN=39 SD=38 SPK±=喇叭");
+    ESP_LOGI(TAG, "    ST7735S   VCC=5V(!)  GND=GND SCL=21 SDA=14 RES=1 DC=48 CS=47 BLK=2");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "  ⚠ 两个模块的电源别接混: 屏幕要 5V(板载LDO), 麦克风只能 3V3(接5V会烧)");
+    ESP_LOGI(TAG, "==================================================");
 
     ampInit();
     probePins();        // ⓪ 引脚静态电平 —— 先看有没有接错/短路

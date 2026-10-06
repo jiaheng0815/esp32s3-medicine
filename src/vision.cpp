@@ -1,3 +1,8 @@
+#include "logcfg.h"   /* 必须第一行: 日志配置要在 <Arduino.h> 之前生效 */
+#include "strutil.h"  /* std::string 与 Arduino String 的桥接 */
+
+static const char *TAG = "vision";    // 日志标签
+
 #include "vision.h"
 #include "secrets.h"
 #include "httpio.h"
@@ -178,7 +183,7 @@ static bool camInit(pixformat_t fmt, framesize_t fsize, int fbCount, int quality
 
     const esp_err_t err = esp_camera_init(&c);
     if (err != ESP_OK) {
-        Serial.printf("[CAM] init 失败 (fmt=%d size=%d fb=%d), err=0x%X\n",
+        ESP_LOGI(TAG, "[CAM] init 失败 (fmt=%d size=%d fb=%d), err=0x%X",
                       (int)fmt, (int)fsize, fbCount, err);
         return false;
     }
@@ -194,7 +199,7 @@ static bool camInit(pixformat_t fmt, framesize_t fsize, int fbCount, int quality
     if (s) {
         if (s->set_framesize) {
             const int r = s->set_framesize(s, fsize);
-            if (r != 0) Serial.printf("[CAM] 重放 set_framesize(%d) 失败: %d\n", (int)fsize, r);
+            if (r != 0) ESP_LOGI(TAG, "[CAM] 重放 set_framesize(%d) 失败: %d", (int)fsize, r);
         }
         if (fmt == PIXFORMAT_JPEG && s->set_quality) s->set_quality(s, quality);
 
@@ -227,7 +232,7 @@ static bool camSwitch(pixformat_t fmt, framesize_t fsize, int fbCount, int quali
     if (camInit(fmt, fsize, fbCount, quality)) return true;
 
     /* 重试一次: 偶发失败大多是上一轮还没完全释放 */
-    Serial.println("[CAM] 切换失败, 重试一次...");
+    ESP_LOGI(TAG, "[CAM] 切换失败, 重试一次...");
     esp_camera_deinit();
     delay(250);
     if (camInit(fmt, fsize, fbCount, quality)) return true;
@@ -235,7 +240,7 @@ static bool camSwitch(pixformat_t fmt, framesize_t fsize, int fbCount, int quali
     /* 两次都失败 —— 此时摄像头停在 deinit 状态, 主循环再也拿不到帧, 屏幕会一直黑。
        与其留一个黑屏、还只能手动复位才能救的设备, 不如自己重启:
        重启回来至少取景是好的, 用户还能继续用 */
-    Serial.println("[CAM] 两次都失败, 重启恢复取景...");
+    ESP_LOGI(TAG, "[CAM] 两次都失败, 重启恢复取景...");
     delay(400);
     ESP.restart();
     return false;                            // 走不到这里
@@ -255,7 +260,7 @@ bool visionInitViewMode()
         return false;
     }
     sensor_t *s = esp_camera_sensor_get();
-    if (s) Serial.printf("[CAM] PID=0x%04X, 取景 RGB565 QVGA 320x240\n", s->id.PID);
+    if (s) ESP_LOGI(TAG, "[CAM] PID=0x%04X, 取景 RGB565 QVGA 320x240", s->id.PID);
     return true;
 }
 
@@ -302,9 +307,9 @@ VisionResult visionCaptureAndAsk(const char *prompt, VisionStageCb cb)
     if (!camSwitch(PIXFORMAT_RGB565, SHOT_FRAMESIZE, SHOT_FB_COUNT, SHOT_QUALITY)) {
         /* 切失败时摄像头停在 deinit 状态, 必须切回取景模式,
            否则主循环的 esp_camera_fb_get() 会一直拿不到帧、屏幕全黑 */
-        Serial.println("[CAM] 切拍照模式失败, 试着切回取景...");
+        ESP_LOGI(TAG, "[CAM] 切拍照模式失败, 试着切回取景...");
         if (!backToView()) {
-            Serial.println("[CAM] 取景模式也切不回来了, 请复位设备!");
+            ESP_LOGI(TAG, "[CAM] 取景模式也切不回来了, 请复位设备!");
             r.text = "摄像头切换失败, 请复位设备";
             return r;
         }
@@ -330,7 +335,7 @@ VisionResult visionCaptureAndAsk(const char *prompt, VisionStageCb cb)
     if (!fb) {
         r.text = "拍照超时 —— 摄像头一帧都没出";
     } else if (fb->format != PIXFORMAT_RGB565) {
-        Serial.printf("[CAM] 帧格式不对: format=%d (期望 %d)\n",
+        ESP_LOGI(TAG, "[CAM] 帧格式不对: format=%d (期望 %d)",
                       (int)fb->format, (int)PIXFORMAT_RGB565);
         esp_camera_fb_return(fb);
         r.text = "拿到的帧格式不对 (详见串口)";
@@ -396,7 +401,7 @@ VisionResult visionCaptureAndAsk(const char *prompt, VisionStageCb cb)
                 }
             }
             const uint32_t n = (uint32_t)cw * ch;
-            Serial.printf("[IMG] 照片中心平均色: R=%u G=%u B=%u  (0-255, 相等=白平衡正常)\n",
+            ESP_LOGI(TAG, "[IMG] 照片中心平均色: R=%u G=%u B=%u  (0-255, 相等=白平衡正常)",
                           (unsigned)(sr / n * 255 / 31),
                           (unsigned)(sg / n * 255 / 63),
                           (unsigned)(sb / n * 255 / 31));
@@ -407,7 +412,7 @@ VisionResult visionCaptureAndAsk(const char *prompt, VisionStageCb cb)
             const uint8_t *pc = fb->buf +
                 ((size_t)(y0 + ch / 2) * fb->width + (x0 + cw / 2)) * 2;
             const uint16_t vc = (uint16_t)((pc[0] << 8) | pc[1]);   // 同 frame2jpg 的读法
-            Serial.printf("[IMG] 中心像素原始字节: %02X %02X -> R=%u G=%u B=%u\n",
+            ESP_LOGI(TAG, "[IMG] 中心像素原始字节: %02X %02X -> R=%u G=%u B=%u",
                           pc[0], pc[1],
                           (unsigned)(((vc >> 11) & 0x1F) * 255 / 31),
                           (unsigned)(((vc >> 5)  & 0x3F) * 255 / 63),
@@ -426,13 +431,13 @@ VisionResult visionCaptureAndAsk(const char *prompt, VisionStageCb cb)
                 out.len < (size_t)SHOT_JPG_CAP - SHOT_JPG_NEAR_CAP) {
                 jpg    = buf;
                 jpgLen = out.len;
-                Serial.printf("[CAM] RGB565 %ux%u -> JPEG %u 字节 (软件编码 %u ms)\n",
+                ESP_LOGI(TAG, "[CAM] RGB565 %ux%u -> JPEG %u 字节 (软件编码 %u ms)",
                               (unsigned)fb->width, (unsigned)fb->height,
                               (unsigned)out.len, (unsigned)(millis() - t0));
             } else if (out.len >= (size_t)SHOT_JPG_CAP - SHOT_JPG_NEAR_CAP) {
                 /* 贴着上限 = 被腰斩。这种帧发出去 API 只会回「格式错误」,
                    在这里拦住并说清楚原因, 比让用户去猜 400 是什么意思强 */
-                Serial.printf("[CAM] JPEG 撞到缓冲上限 (%u / %u 字节) —— 图被截断了!\n"
+                ESP_LOGI(TAG, "[CAM] JPEG 撞到缓冲上限 (%u / %u 字节) —— 图被截断了!"
                               "       要么调大 SHOT_JPG_CAP, 要么把 SHOT_QUALITY 调大(降质量)\n",
                               (unsigned)out.len, (unsigned)SHOT_JPG_CAP);
                 heap_caps_free(buf);
@@ -448,7 +453,7 @@ VisionResult visionCaptureAndAsk(const char *prompt, VisionStageCb cb)
     /* ---- 3. 立刻切回取景模式 ----
        JPEG 已经在手上了, 后面上传要好几秒, 没必要占着摄像头 */
     if (!backToView()) {
-        Serial.println("[CAM] 切回取景模式失败!");
+        ESP_LOGI(TAG, "[CAM] 切回取景模式失败!");
         if (jpg) heap_caps_free(jpg);
         r.text = "切回取景模式失败, 请复位";
         return r;
@@ -481,22 +486,22 @@ VisionResult visionCaptureAndAsk(const char *prompt, VisionStageCb cb)
 #else
     heap_caps_free(jpg);                     // 原图用完就扔, 压峰值内存
 #endif
-    Serial.printf("[IMG] 原图 %u -> base64 %u 字节\n",
+    ESP_LOGI(TAG, "[IMG] 原图 %u -> base64 %u 字节",
                   (unsigned)jpgLen, (unsigned)b64Len);
 
     /* ---- 5. 拼请求 ---- */
-    const String prefix =
-        String("{\"model\":\"") + ZHIPU_MODEL +
+    const std::string prefix =
+        std::string("{\"model\":\"") + ZHIPU_MODEL +
         "\",\"messages\":[{\"role\":\"user\",\"content\":["
         "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,";
-    String suffix =
-        String("\"}},{\"type\":\"text\",\"text\":\"") + httpJsonEscape(prompt) +
-        "\"}]}],\"max_tokens\":" + String(SHOT_MAX_TOKENS) + ",\"temperature\":0.1";
+    std::string suffix =
+        std::string("\"}},{\"type\":\"text\",\"text\":\"") + httpJsonEscape(prompt) +
+        "\"}]}],\"max_tokens\":" + std::to_string(SHOT_MAX_TOKENS) + ",\"temperature\":0.1";
 #if DISABLE_THINKING
     suffix += ",\"thinking\":{\"type\":\"disabled\"}";
 #endif
     suffix += "}";
-    const size_t bodyLen = prefix.length() + b64Len + suffix.length();
+    const size_t bodyLen = prefix.size() + b64Len + suffix.size();
 
     /* ---- 6. HTTPS 发出去 ---- */
     if (cb) cb("Uploading...");
@@ -506,7 +511,7 @@ VisionResult visionCaptureAndAsk(const char *prompt, VisionStageCb cb)
        三步的顺序有讲究, 见 httpio.h 的注释 */
     if (!httpConnect(client, ZHIPU_HOST, 443, TLS_TIMEOUT_S)) {
         heap_caps_free(b64);
-        Serial.println("[API] TLS 连接失败");
+        ESP_LOGI(TAG, "[API] TLS 连接失败");
         r.text = "TLS 连接失败 (内存不够或网络不通)";
         return r;
     }
@@ -520,13 +525,13 @@ VisionResult visionCaptureAndAsk(const char *prompt, VisionStageCb cb)
 
     /* body 分块写, 不拼成一整个大 String —— 那样要再拷一份 100+KB。
        writeAll() 里面会循环, 单次 write() 发不完一个 TLS 记录之外的部分 */
-    client.print(prefix);
+    client.print(prefix.c_str());
     const bool bodySent = httpWriteAll(client, b64, b64Len);
-    if (bodySent) client.print(suffix);
+    if (bodySent) client.print(suffix.c_str());
     heap_caps_free(b64);
 
     if (!bodySent) {
-        Serial.println("[API] 图片没能发完");
+        ESP_LOGI(TAG, "[API] 图片没能发完");
         client.stop();
         r.text = "上传中断 (图片没发完)";
         return r;
@@ -538,27 +543,27 @@ VisionResult visionCaptureAndAsk(const char *prompt, VisionStageCb cb)
     bool chunked = false;
     const int code = httpReadHeader(client, chunked);
 
-    const String raw = httpReadBody(client, 20000);   // 总读取超时 20 秒
+    const std::string raw = httpReadBody(client, 20000);   // 总读取超时 20 秒
     client.stop();
 
-    const String body = chunked ? httpDecodeChunked(raw) : raw;
+    const std::string body = chunked ? httpDecodeChunked(raw) : raw;
 
     if (code != 200) {
-        Serial.printf("[API] HTTP %d, 原始响应(前512字节):\n%s\n",
-                      code, body.substring(0, 512).c_str());
-        r.text = String("HTTP ") + code + " —— 详见串口";
+        ESP_LOGE(TAG, "[API] HTTP %d, 原始响应(前512字节): %s",
+                 code, strSub(body, 0, 512).c_str());
+        r.text = "HTTP " + std::to_string(code) + " —— 详见串口";
         return r;
     }
 
-    const String answer = httpExtractContent(body);
-    if (answer.isEmpty()) {
+    const std::string answer = httpExtractContent(body);
+    if (answer.empty()) {
         /* content 是空的有两种典型原因, 分开提示好排障 */
-        if (body.indexOf("reasoning_content") >= 0) {
-            Serial.println("[API] content 是空的, 但响应里有 reasoning_content ——");
-            Serial.println("      模型的思考过程把 max_tokens 吃光了, 答案没来得及生成。");
-            Serial.println("      检查 DISABLE_THINKING 是否生效, 或把 SHOT_MAX_TOKENS 再调大");
+        if (strIndex(body, "reasoning_content") >= 0) {
+            ESP_LOGI(TAG, "[API] content 是空的, 但响应里有 reasoning_content ——");
+            ESP_LOGI(TAG, "      模型的思考过程把 max_tokens 吃光了, 答案没来得及生成。");
+            ESP_LOGI(TAG, "      检查 DISABLE_THINKING 是否生效, 或把 SHOT_MAX_TOKENS 再调大");
         }
-        Serial.printf("[API] 原始响应(前512字节):\n%s\n", body.substring(0, 512).c_str());
+        ESP_LOGI(TAG, "[API] 原始响应(前512字节): %s", strSub(body, 0, 512).c_str());
         r.text = "模型没返回答案 (详见串口)";
         return r;
     }
@@ -580,15 +585,15 @@ void visionBenchCapture()
         { FRAMESIZE_SVGA, "RGB565 SVGA 800x600" },
     };
 
-    Serial.println("\n========== 拍照链路诊断 ==========");
-    Serial.println("(取景模式是 RGB565 QVGA, 下面每个都是从这里切过去的)");
-    Serial.printf("JPEG 硬件模式已知在这块 OV3660 上不出帧, 不再测试\n");
+    ESP_LOGI(TAG, "\n========== 拍照链路诊断 ==========");
+    ESP_LOGI(TAG, "(取景模式是 RGB565 QVGA, 下面每个都是从这里切过去的)");
+    ESP_LOGI(TAG, "JPEG 硬件模式已知在这块 OV3660 上不出帧, 不再测试");
 
     for (const Case &c : cases) {
-        Serial.printf("\n--- %s ---\n", c.name);
+        ESP_LOGI(TAG, "\n--- %s ---", c.name);
 
         if (!camSwitch(PIXFORMAT_RGB565, c.size, 1, SHOT_QUALITY)) {
-            Serial.println("    init 失败");
+            ESP_LOGI(TAG, "    init 失败");
             continue;
         }
 
@@ -597,34 +602,34 @@ void visionBenchCapture()
         const uint32_t dt = millis() - t0;
 
         if (!fb) {
-            Serial.printf("    拿不到帧 (等了 %u ms)\n", (unsigned)dt);
+            ESP_LOGI(TAG, "    拿不到帧 (等了 %u ms)", (unsigned)dt);
             continue;
         }
-        Serial.printf("    拍到 %u 字节 %ux%u (等了 %u ms)\n",
+        ESP_LOGI(TAG, "    拍到 %u 字节 %ux%u (等了 %u ms)",
                       (unsigned)fb->len, (unsigned)fb->width, (unsigned)fb->height,
                       (unsigned)dt);
 
         /* 顺便量一下软件编码的耗时和产物大小 —— 这才是真正要上传的东西 */
         uint8_t *buf = (uint8_t *)heap_caps_malloc(SHOT_JPG_CAP, MALLOC_CAP_SPIRAM);
         if (!buf) {
-            Serial.println("    PSRAM 不够, 跳过编码测试");
+            ESP_LOGI(TAG, "    PSRAM 不够, 跳过编码测试");
         } else {
             JpgBuf out = { buf, SHOT_JPG_CAP, 0 };
             const uint32_t t1 = millis();
             if (frame2jpg_cb(fb, SHOT_JPEG_Q100, jpgOutCb, &out) && out.len > 0) {
-                Serial.printf("    编码成 JPEG %u 字节 (耗时 %u ms), base64 后约 %u 字节\n",
+                ESP_LOGI(TAG, "    编码成 JPEG %u 字节 (耗时 %u ms), base64 后约 %u 字节",
                               (unsigned)out.len, (unsigned)(millis() - t1),
                               (unsigned)(4 * ((out.len + 2) / 3)));
             } else {
-                Serial.println("    软件 JPEG 编码失败");
+                ESP_LOGI(TAG, "    软件 JPEG 编码失败");
             }
             heap_caps_free(buf);
         }
         esp_camera_fb_return(fb);
     }
 
-    Serial.println("\n========== 诊断结束 ==========");
-    Serial.println("把上面这段发给开发者; 掉电重启即可恢复正常模式");
+    ESP_LOGI(TAG, "\n========== 诊断结束 ==========");
+    ESP_LOGI(TAG, "把上面这段发给开发者; 掉电重启即可恢复正常模式");
     for (;;) delay(1000);          // 停住, 别让取景把日志冲掉
 }
 
@@ -635,11 +640,11 @@ void visionBenchCapture()
 void visionPreviewLastShot(uint16_t seconds)
 {
     if (!s_lastJpg || s_lastJpgLen == 0) {
-        Serial.println("[IMG] 还没有可预览的照片");
+        ESP_LOGI(TAG, "[IMG] 还没有可预览的照片");
         return;
     }
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[IMG] WiFi 没连, 没法预览");
+        ESP_LOGI(TAG, "[IMG] WiFi 没连, 没法预览");
         return;
     }
 
@@ -663,10 +668,10 @@ void visionPreviewLastShot(uint16_t seconds)
 
     server.begin();
 
-    Serial.printf("\n[IMG] 照片预览已开 —— 浏览器打开 %s  (%.0f 秒后自动关)\n",
-                  (String("http://") + WiFi.localIP().toString()).c_str(),
+    ESP_LOGI(TAG, "\n[IMG] 照片预览已开 —— 浏览器打开 %s  (%.0f 秒后自动关)",
+                  (std::string("http://") + toStd(WiFi.localIP().toString())).c_str(),
                   (double)seconds);
-    Serial.printf("[IMG] 这张 JPEG %u 字节, 就是刚发给模型的那张\n",
+    ESP_LOGI(TAG, "[IMG] 这张 JPEG %u 字节, 就是刚发给模型的那张",
                   (unsigned)s_lastJpgLen);
 
     const uint32_t t0 = millis();
@@ -676,7 +681,7 @@ void visionPreviewLastShot(uint16_t seconds)
     }
 
     server.stop();
-    Serial.println("[IMG] 预览结束, 恢复取景\n");
+    ESP_LOGI(TAG, "[IMG] 预览结束, 恢复取景");
 }
 
 const uint8_t *visionLastJpeg(size_t &len)

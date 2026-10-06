@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include <string>
 
 /* 药品记忆 —— 存在 NVS 里, 断网也能查。
  *
@@ -53,11 +54,11 @@ bool medTimeReady();
 uint32_t medNow();
 
 /* 格式化时间戳为 "08:30"; 传 0 返回 "从未" */
-String medFmtTime(uint32_t ts);
+std::string medFmtTime(uint32_t ts);
 
 /* 核心: 现在该不该吃。
  * 返回一句可直接打印的中文说明 —— 这条路径全在本地算, 不调任何 API。 */
-String medAdvice(const char *name);
+std::string medAdvice(const char *name);
 
 /* ---------- 自然语言输入 ---------- */
 
@@ -71,4 +72,4 @@ String medAdvice(const char *name);
  *   "阿莫西林一天两次" -> 记用药方案
  *   "阿莫西林"         -> 查该不该吃
  * 药名必须已经在记录里(拍照识别过或手动加过), 否则提示先去添加。 */
-String medHandleUtterance(const char *text);
+std::string medHandleUtterance(const char *text);

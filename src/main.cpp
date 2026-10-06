@@ -33,6 +33,8 @@
  *   secrets.h   API Key (不进版本库)
  */
 
+#include "logcfg.h"     /* ⚠️ 必须第一行: 日志配置要在 <Arduino.h> 之前生效 */
+
 #include <Arduino.h>
 #include <SPI.h>
 #include <Preferences.h>
@@ -49,6 +51,8 @@
 #include "voice.h"
 #include "hwtest.h"
 #include "cnfont.h"
+
+static const char *TAG = "main";    // ESP-IDF 日志标签
 
 /* ============================================================
  * 0. 运行模式  ← 想切模式改这一行
@@ -96,7 +100,7 @@
  *
  * 验完改成 0(它只在启动时播一次, 留着也不碍事, 但会拖慢开机几秒)。
  * ⚠️ 需要联网, 且账户有余额(TTS 按字符计费)。 */
-#define TTS_TEST        1
+#define TTS_TEST        0
 #define TTS_TEST_TEXT   "语音测试成功，galgame牛逼"
 
 /* ============================================================
@@ -196,7 +200,7 @@ static uint8_t nextAutoTab()
     prefs.begin("tft", false);
     uint8_t idx = prefs.getUChar("tab", 0);
     if (idx > 2) idx = 0;
-    Serial.printf("[TFT] tab=%s (自动轮换, 共3种; 下次上电试 %s)\n",
+    ESP_LOGI(TAG, "[TFT] tab=%s (自动轮换, 共3种; 下次上电试 %s)",
                   names[idx], names[(idx + 1) % 3]);
     prefs.putUChar("tab", (uint8_t)((idx + 1) % 3));
     prefs.end();
@@ -217,7 +221,7 @@ static void displayInit()
 #if TFT_TAB_AUTO
     tab = nextAutoTab();
 #else
-    Serial.printf("[TFT] tab=%d (固定)\n", (int)tab);
+    ESP_LOGI(TAG, "[TFT] tab=%d (固定)", (int)tab);
 #endif
     tft.initR(tab);
     tft.setSPISpeed(SPI_SPEED_HZ);
@@ -227,7 +231,7 @@ static void displayInit()
 #endif
     tft.fillScreen(ST77XX_BLACK);
 
-    Serial.printf("[TFT] %dx%d  SCLK=%d MOSI=%d CS=%d DC=%d RST=%d BL=%d\n",
+    ESP_LOGI(TAG, "[TFT] %dx%d  SCLK=%d MOSI=%d CS=%d DC=%d RST=%d BL=%d",
                   tft.width(), tft.height(),
                   TFT_SCLK_PIN, TFT_MOSI_PIN, TFT_CS_PIN,
                   TFT_DC_PIN, TFT_RST_PIN, TFT_BL_PIN);
@@ -274,7 +278,7 @@ static void pixelDefectTest()
     };
     static const char *names[5] = { "RED", "GREEN", "BLUE", "WHITE", "BLACK" };
 
-    Serial.println("[TEST] ① 屏幕坏点测试: 短按换色, 长按下一阶段");
+    ESP_LOGI(TAG, "[TEST] ① 屏幕坏点测试: 短按换色, 长按下一阶段");
 
     for (int i = 0; i < 5; i++) {
         tft.fillScreen(colors[i]);
@@ -292,7 +296,7 @@ static void pixelDefectTest()
         delay(1600);
 
         tft.fillScreen(colors[i]);       // 抹掉文字, 留纯色给人看
-        Serial.printf("[TEST]   纯色 %s (%d/5)\n", names[i], i + 1);
+        ESP_LOGI(TAG, "[TEST]   纯色 %s (%d/5)", names[i], i + 1);
 
         if (testWaitButton()) return;    // 长按 -> 下一阶段
     }
@@ -303,8 +307,8 @@ static void fontIntegrityCheck()
 {
     const uint32_t total = cnFontCount();     // 取一次, 别在循环条件里反复调
 
-    Serial.println("\n========== 中文字库自检 ==========");
-    Serial.printf("字数 %u, 数据 %u 字节 (%.0f KB)\n",
+    ESP_LOGI(TAG, "\n========== 中文字库自检 ==========");
+    ESP_LOGI(TAG, "字数 %u, 数据 %u 字节 (%.0f KB)",
                   (unsigned)total, (unsigned)(total * 34),
                   total * 34 / 1024.0);
 
@@ -316,7 +320,7 @@ static void fontIntegrityCheck()
         if (cp <= prev) disorder++;
         prev = cp;
     }
-    Serial.printf("① 码点升序: %s   (逆序/重复 %u 处)\n",
+    ESP_LOGI(TAG, "① 码点升序: %s   (逆序/重复 %u 处)",
                   disorder ? "!! 失败 !!" : "通过", (unsigned)disorder);
 
     /* ② 二分查找能命中每个字 */
@@ -324,7 +328,7 @@ static void fontIntegrityCheck()
     for (uint32_t i = 0; i < total; i++) {
         if (!cnGlyph(cnCodePointAt(i))) miss++;
     }
-    Serial.printf("② 二分查找: %s   (查不到 %u 个)\n",
+    ESP_LOGI(TAG, "② 二分查找: %s   (查不到 %u 个)",
                   miss ? "!! 失败 !!" : "通过", (unsigned)miss);
 
     /* ③ 抽样看点阵是否全空 */
@@ -337,9 +341,9 @@ static void fontIntegrityCheck()
         for (int b = 0; b < 32 && !any; b++) any = (g[b] != 0);
         if (!any) blank++;
     }
-    Serial.printf("③ 点阵非空: %s   (抽 %u, 空 %u)\n",
+    ESP_LOGI(TAG, "③ 点阵非空: %s   (抽 %u, 空 %u)",
                   blank ? "!! 可疑 !!" : "通过", (unsigned)sampled, (unsigned)blank);
-    Serial.println("=================================\n");
+    ESP_LOGI(TAG, "=================================");
 }
 
 static void fontBrowseLoop()
@@ -349,7 +353,7 @@ static void fontBrowseLoop()
     const uint32_t total    = cnFontCount();
     const uint32_t PAGES    = (total + PER_PAGE - 1) / PER_PAGE;
 
-    Serial.printf("[TEST] ② 中文字库: %u 字, %u 页 (短按翻页, 长按下一阶段)\n",
+    ESP_LOGI(TAG, "[TEST] ② 中文字库: %u 字, %u 页 (短按翻页, 长按下一阶段)",
                   (unsigned)total, (unsigned)PAGES);
 
     uint32_t page = 0;
@@ -371,7 +375,7 @@ static void fontBrowseLoop()
         if (testWaitButton()) return;        // 长按 -> 下一阶段
 
         page = (page + 1) % PAGES;           // 短按 -> 翻一页
-        Serial.printf("[TEST]   第 %u/%u 页, 首字码点 %04X\n",
+        ESP_LOGI(TAG, "[TEST]   第 %u/%u 页, 首字码点 %04X",
                       (unsigned)(page + 1), (unsigned)PAGES,
                       (unsigned)cnCodePointAt(page * PER_PAGE));
     }
@@ -380,19 +384,19 @@ static void fontBrowseLoop()
 /* ---------- 测试模式主流程 ---------- */
 static void testModeRun()
 {
-    Serial.println("\n########## TEST 模式 ##########");
-    Serial.println("顺序: ① 屏幕坏点 -> ② 中文字库 -> ③ 摄像头 AI 识别");
-    Serial.println("手势: 全程 短按 = 下一步, 长按 = 跳到下一阶段\n");
+    ESP_LOGI(TAG, "\n########## TEST 模式 ##########");
+    ESP_LOGI(TAG, "顺序: ① 屏幕坏点 -> ② 中文字库 -> ③ 摄像头 AI 识别");
+    ESP_LOGI(TAG, "手势: 全程 短按 = 下一步, 长按 = 跳到下一阶段");
 
-    Serial.println("---- [1/3] 屏幕坏点测试 ----");
+    ESP_LOGI(TAG, "---- [1/3] 屏幕坏点测试 ----");
     pixelDefectTest();
 
-    Serial.println("\n---- [2/3] 中文字库测试 ----");
+    ESP_LOGI(TAG, "\n---- [2/3] 中文字库测试 ----");
     fontIntegrityCheck();
     fontBrowseLoop();
 
-    Serial.println("\n---- [3/3] 摄像头 AI 识别 ----");
-    Serial.println("短按拍照识图; 想重跑测试就复位\n");
+    ESP_LOGI(TAG, "\n---- [3/3] 摄像头 AI 识别 ----");
+    ESP_LOGI(TAG, "短按拍照识图; 想重跑测试就复位");
     /* 不返回 —— 后面 setup 会接着初始化摄像头, 然后进正常 loop */
 }
 
@@ -442,7 +446,7 @@ static void testFrame()
 static void bootSelfTest()
 {
 #if PANEL_SELFTEST
-    Serial.println("[TFT] 自检: 依次闪 红/绿/蓝/白, 屏幕没反应就是屏幕侧不通");
+    ESP_LOGI(TAG, "[TFT] 自检: 依次闪 红/绿/蓝/白, 屏幕没反应就是屏幕侧不通");
     tft.fillScreen(ST77XX_RED);   delay(260);
     tft.fillScreen(ST77XX_GREEN); delay(260);
     tft.fillScreen(ST77XX_BLUE);  delay(260);
@@ -454,9 +458,9 @@ static void bootSelfTest()
 /* 纯屏幕测试模式: 按住 BOOT 再复位进入, 用来判断"屏幕/接线"本身是否正常 */
 static void panelTestLoop()
 {
-    Serial.println("[TEST] 纯屏幕测试模式: 不启动摄像头, 复位退出");
+    ESP_LOGI(TAG, "[TEST] 纯屏幕测试模式: 不启动摄像头, 复位退出");
     for (uint8_t step = 0;; step++) {
-        Serial.printf("[TEST] pattern %u/6\n", (unsigned)(step % 6));
+        ESP_LOGI(TAG, "[TEST] pattern %u/6", (unsigned)(step % 6));
         switch (step % 6) {
         case 0: tft.fillScreen(ST77XX_RED);   break;
         case 1: tft.fillScreen(ST77XX_GREEN); break;
@@ -747,24 +751,24 @@ static const char ASK_PROMPT[] =
 static void runCaptureAsk()
 {
 #if IS_TEST
-    Serial.println("\n[KEY] 短按 -> 拍照识图 (TEST 模式)");
+    ESP_LOGI(TAG, "\n[KEY] 短按 -> 拍照识图 (TEST 模式)");
 #else
-    Serial.println("\n[KEY] 短按 -> 拍照识别药品");
+    ESP_LOGI(TAG, "\n[KEY] 短按 -> 拍照识别药品");
 #endif
 
     const VisionResult r = visionCaptureAndAsk(ASK_PROMPT, onVisionStage);
 
     if (r.ok) {
-        Serial.println("\n========== 模型回答 ==========");
-        Serial.println(r.text);
-        Serial.println("==============================");
+        ESP_LOGI(TAG, "\n========== 模型回答 ==========");
+        ESP_LOGI(TAG, "%s", r.text.c_str());
+        ESP_LOGI(TAG, "==============================");
 
 #if !IS_TEST
         /* 第二阶段: 本地查记忆、本地算时间 —— 纯本地, 不调 API */
-        const String advice = medAdvice(r.text.c_str());
-        Serial.println("\n========== 用药提醒 ==========");
-        Serial.println(advice);
-        Serial.println("==============================");
+        const std::string advice = medAdvice(r.text.c_str());
+        ESP_LOGI(TAG, "\n========== 用药提醒 ==========");
+        ESP_LOGI(TAG, "%s", advice.c_str());
+        ESP_LOGI(TAG, "==============================");
 
         /* 药名和结论都上屏 —— cnfont 有中文点阵, 不用只靠串口 */
         drawVoiceResult(r.text.c_str(), advice.c_str());
@@ -780,7 +784,7 @@ static void runCaptureAsk()
 #endif
     } else {
         showStatus("Failed", "see serial");
-        Serial.printf("\n[ERR] %s\n", r.text.c_str());
+        ESP_LOGI(TAG, "\n[ERR] %s", r.text.c_str());
     }
 
 #if SHOT_PREVIEW && IS_TEST
@@ -860,12 +864,12 @@ static void handleBootButton()
         holdFired  = true;
         firstTapUp = 0;                                 // 长按不算双击的第二击
 #if IS_TEST
-        Serial.println("\n[KEY] 长按 (TEST 模式已关掉语音)");
+        ESP_LOGI(TAG, "\n[KEY] 长按 (TEST 模式已关掉语音)");
 #else
         if (voiceStartRec()) {
-            Serial.println("\n[KEY] 按住 -> 录音中, 松手结束并识别");
+            ESP_LOGI(TAG, "\n[KEY] 按住 -> 录音中, 松手结束并识别");
         } else {
-            Serial.println("\n[KEY] 上一段语音还没处理完, 本次忽略");
+            ESP_LOGI(TAG, "\n[KEY] 上一段语音还没处理完, 本次忽略");
         }
 #endif
         return;
@@ -885,7 +889,7 @@ static void handleBootButton()
 
         if (secondTap) {                                // 双击 -> 配网
             secondTap = false;
-            Serial.println("\n[KEY] 双击 -> 进配网模式");
+            ESP_LOGI(TAG, "\n[KEY] 双击 -> 进配网模式");
             WiFi.disconnect(true);
             wifiRunSetupPortal(onSetupStatus);          // 不会返回: 存完或超时都会重启
             return;
@@ -900,9 +904,10 @@ static void handleBootButton()
 /* ====================== setup / loop ====================== */
 void setup()
 {
-    Serial.begin(115200);
+    /* ⚠️ 不调 Serial.begin() —— 日志走 ESP_LOG, UART0 由 IDF 的 console
+       (CONFIG_ESP_CONSOLE_UART_DEFAULT=y) 自己初始化, 不需要 Arduino 再插一手。 */
     delay(200);
-    Serial.println("\n=== ESP32-S3-CAM + ST7735S 取景器 ===");
+    ESP_LOGI(TAG, "=== ESP32-S3-CAM + ST7735S 取景器 ===");
 
     /* IDF 写法, 等价于 pinMode(BOOT_PIN, INPUT_PULLUP) */
     gpio_config_t bootCfg = {};
@@ -914,15 +919,15 @@ void setup()
     gpio_config(&bootCfg);
 
     const bool bootHeld = (gpio_get_level((gpio_num_t)BOOT_PIN) == 0);
-    if (bootHeld) Serial.println("[SYS] 检测到 BOOT 按下 -> 纯屏幕测试模式");
+    if (bootHeld) ESP_LOGI(TAG, "[SYS] 检测到 BOOT 按下 -> 纯屏幕测试模式");
 
-    Serial.printf("[SYS] PSRAM: %u KB, 可用堆: %u KB\n",
+    ESP_LOGI(TAG, "[SYS] PSRAM: %u KB, 可用堆: %u KB",
                   (unsigned)(heap_caps_get_total_size(MALLOC_CAP_SPIRAM) / 1024),
                   (unsigned)(ESP.getFreeHeap() / 1024));
 
     /* loopTask 固定跑在 core 1 (CONFIG_ARDUINO_RUNNING_CORE=1);
        core 0 上是 cam_task(CONFIG_CAMERA_CORE0) 和 lwIP 协议栈 */
-    Serial.printf("[SYS] 本固件的主循环跑在 core %d\n", xPortGetCoreID());
+    ESP_LOGI(TAG, "[SYS] 本固件的主循环跑在 core %d", xPortGetCoreID());
 
     /* TFT 互斥锁在这里就建好, 别指望 tftLock() 里的懒初始化:
        语音 task 和主循环可能同时第一次调用, 各自建一个 mutex = 等于没锁 */
@@ -964,8 +969,11 @@ void setup()
 
     /* ---- WiFi: 有凭据就连, 没凭据/连不上就进配网 ---- */
     if (!wifiConnectStored(10000)) {
-        Serial.println(wifiHasStored() ? "[WIFI] 连不上, 进配网模式"
-                                       : "[WIFI] 还没配过网, 进配网模式");
+        /* ⚠️ 不能把三元表达式直接当 format —— ESP_LOGI 展开成
+           log_i("[%s] " format, tag, ...), 靠**字符串字面量拼接**塞 TAG,
+           三元表达式拼不上。所以用 "%s" 占位, 把结果当参数传。 */
+        ESP_LOGI(TAG, "%s", wifiHasStored() ? "[WIFI] 连不上, 进配网模式"
+                                            : "[WIFI] 还没配过网, 进配网模式");
         wifiRunSetupPortal(onSetupStatus);          // 不会返回, 内部会重启
     }
 
@@ -992,7 +1000,7 @@ void setup()
        如果在这里同步等, 一旦 TTS 请求慢或卡住, 整个开机流程会被拖死
        (实测卡过 40 秒不进主循环)。丢给后台就行, 结果看串口的 [TTS] 日志。 */
     showStatus("TTS test", "listen to speaker");
-    Serial.printf("\n[TTS-TEST] 开始播报: %s\n", TTS_TEST_TEXT);
+    ESP_LOGI(TAG, "\n[TTS-TEST] 开始播报: %s", TTS_TEST_TEXT);
     voiceSpeakAsync(TTS_TEST_TEXT);
 #endif
 #endif
@@ -1003,11 +1011,11 @@ void setup()
     configTzTime("CST-8", "ntp.aliyun.com", "pool.ntp.org");
     struct tm tmNow;
     if (getLocalTime(&tmNow, 8000)) {
-        Serial.printf("[TIME] 已对时: %04d-%02d-%02d %02d:%02d\n",
+        ESP_LOGI(TAG, "[TIME] 已对时: %04d-%02d-%02d %02d:%02d",
                       tmNow.tm_year + 1900, tmNow.tm_mon + 1, tmNow.tm_mday,
                       tmNow.tm_hour, tmNow.tm_min);
     } else {
-        Serial.println("[TIME] NTP 同步失败 —— 用药提醒将只记录、不判断时序");
+        ESP_LOGI(TAG, "[TIME] NTP 同步失败 —— 用药提醒将只记录、不判断时序");
     }
 
     /* ---- 摄像头 ---- */
@@ -1044,7 +1052,7 @@ void loop()
         if (!g_reported) {
             g_scale = fb->width / VIEW_W;
             if (g_scale < 1) g_scale = 1;
-            Serial.printf("[CAM] 实际输出 %ux%u RGB565, 降采样 %dx -> %dx%d\n",
+            ESP_LOGI(TAG, "[CAM] 实际输出 %ux%u RGB565, 降采样 %dx -> %dx%d",
                           (unsigned)fb->width, (unsigned)fb->height, g_scale,
                           VIEW_W, VIEW_H);
             g_reported = true;
@@ -1079,6 +1087,6 @@ void loop()
         g_fps  = frames * 1000 / (now - tLast);
         frames = 0;
         tLast  = now;
-        Serial.printf("[FPS] %u\n", (unsigned)g_fps);
+        ESP_LOGI(TAG, "[FPS] %u", (unsigned)g_fps);
     }
 }

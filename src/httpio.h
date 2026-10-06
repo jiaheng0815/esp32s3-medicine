@@ -1,6 +1,7 @@
 #pragma once
-#include <Arduino.h>
+#include <Arduino.h>            /* 仍要 String: readStringUntil 返回的是它 */
 #include <WiFiClientSecure.h>
+#include <string>
 
 /* 共享的 HTTPS 传输层。
  *
@@ -25,11 +26,11 @@ bool httpConnect(WiFiClientSecure &c, const char *host, uint16_t port, uint32_t 
  * 首行给 90 秒 —— 非流式接口是「模型推理完才发响应头」, 想 10~60 秒都正常。 */
 int httpReadHeader(WiFiClientSecure &c, bool &chunked);
 
-/* 把剩余响应体读成 String, 带总超时 */
-String httpReadBody(WiFiClientSecure &c, uint32_t timeoutMs);
+/* 把剩余响应体读成字符串, 带总超时 */
+std::string httpReadBody(WiFiClientSecure &c, uint32_t timeoutMs);
 
 /* 解 Transfer-Encoding: chunked */
-String httpDecodeChunked(const String &raw);
+std::string httpDecodeChunked(const std::string &raw);
 
 /* 从 JSON 里取一个字符串字段 (含 \uXXXX → UTF-8 转换)。
  *
@@ -37,12 +38,12 @@ String httpDecodeChunked(const String &raw);
  * ASR 的响应 schema 是 {id, created, request_id, model, text},
  * 转写文字在**顶层 text**, 不是 choices[0].message.content。
  * 拿错了不会报错, 只会永远得到空串, 特别难查。 */
-String httpExtractStringField(const String &json, const char *key);
+std::string httpExtractStringField(const std::string &json, const char *key);
 
 /* 从 OpenAI 风格响应里取 choices[0].message.content。
  * 等价于 httpExtractStringField(json, "content")。
  * 不引 ArduinoJson: 只需要一个字段, 手写反而更省 flash。 */
-String httpExtractContent(const String &json);
+std::string httpExtractContent(const std::string &json);
 
 /* 把字符串转义成能安全放进 JSON 字面量的形式 (只处理 " 和 \) */
-String httpJsonEscape(const char *s);
+std::string httpJsonEscape(const char *s);

@@ -1,3 +1,8 @@
+#include "logcfg.h"     /* 必须第一行: 日志配置要在 <Arduino.h> 之前生效 */
+#include "strutil.h"    /* std::string 与 Arduino String 的桥接 */
+
+static const char *TAG = "httpio";    // 日志标签
+
 #include "httpio.h"
 
 /* ==================== 写 ==================== */
@@ -44,17 +49,22 @@ int httpReadHeader(WiFiClientSecure &c, bool &chunked)
         const uint32_t t0 = millis();
         while (!c.available() && c.connected() && millis() - t0 < waitMs) delay(5);
         if (!c.available()) {
-            if (n == 0) Serial.println("[HTTP] 等响应头超时 (对端没在 90 秒内回话)");
+            if (n == 0) ESP_LOGE(TAG, "[HTTP] 等响应头超时 (对端没在 90 秒内回话)");
             break;
         }
 
-        String line = c.readStringUntil('\n');
-        line.trim();
-        if (line.isEmpty()) break;          // 空行 = header 结束
-        if (line.startsWith("HTTP/")) {
-            const int sp = line.indexOf(' ');
-            if (sp > 0) code = line.substring(sp + 1, sp + 4).toInt();
-        } else if (line.startsWith("Transfer-Encoding:") && line.indexOf("chunked") > 0) {
+        /* readStringUntil 是 Stream 的方法, 返回的就是 Arduino String ——
+           这是必须过桥的边界, 拿到立刻转成 std::string, 后面全用它 */
+        std::string line = toStd(c.readStringUntil('\n'));
+        strTrim(line);
+        if (line.empty()) break;                    // 空行 = header 结束
+
+        if (strStartsWith(line, "HTTP/")) {
+            const size_t sp = line.find(' ');
+            if (sp != std::string::npos)
+                code = strToInt(strSub(line, sp + 1, sp + 4));
+        } else if (strStartsWith(line, "Transfer-Encoding:") &&
+                   line.find("chunked") != std::string::npos) {
             chunked = true;
         }
     }
@@ -62,9 +72,9 @@ int httpReadHeader(WiFiClientSecure &c, bool &chunked)
 }
 
 /* ==================== 读体 ==================== */
-String httpReadBody(WiFiClientSecure &c, uint32_t timeoutMs)
+std::string httpReadBody(WiFiClientSecure &c, uint32_t timeoutMs)
 {
-    String raw;
+    std::string raw;
     const uint32_t t0 = millis();
     while (millis() - t0 < timeoutMs) {
         while (c.available()) raw += (char)c.read();
@@ -74,46 +84,46 @@ String httpReadBody(WiFiClientSecure &c, uint32_t timeoutMs)
     return raw;
 }
 
-String httpDecodeChunked(const String &raw)
+std::string httpDecodeChunked(const std::string &raw)
 {
-    String out;
-    int pos = 0;
-    while (pos < (int)raw.length()) {
-        const int eol = raw.indexOf("\r\n", pos);
+    std::string out;
+    size_t pos = 0;
+    while (pos < raw.size()) {
+        const int eol = strIndex(raw, "\r\n", pos);
         if (eol < 0) break;
-        const long sz = strtol(raw.substring(pos, eol).c_str(), nullptr, 16);
+        const long sz = strtol(strSub(raw, pos, (size_t)eol).c_str(), nullptr, 16);
         if (sz <= 0) break;
-        pos = eol + 2;
-        if (pos + sz > (int)raw.length()) { out += raw.substring(pos); break; }
-        out += raw.substring(pos, pos + sz);
-        pos += sz + 2;            // 跳过数据块尾部的 \r\n
+        pos = (size_t)eol + 2;
+        if (pos + (size_t)sz > raw.size()) { out += strSub(raw, pos); break; }
+        out += strSub(raw, pos, pos + (size_t)sz);
+        pos += (size_t)sz + 2;    // 跳过数据块尾部的 \r\n
     }
     return out;
 }
 
 /* ==================== 取字段 ==================== */
-String httpExtractStringField(const String &json, const char *key)
+std::string httpExtractStringField(const std::string &json, const char *key)
 {
     /* 拼成 "key" 形式再找 —— 带引号是为了避开 reasoning_content
        这类「包含同名子串的别的键」被先匹配上 */
-    String pat = "\"";
+    std::string pat = "\"";
     pat += key;
     pat += "\"";
 
-    const int k = json.indexOf(pat);
-    if (k < 0) return "";
+    const size_t k = json.find(pat);
+    if (k == std::string::npos) return "";
 
-    int i = json.indexOf(':', k + pat.length());
-    if (i < 0) return "";
+    size_t i = json.find(':', k + pat.size());
+    if (i == std::string::npos) return "";
     i++;
-    while (i < (int)json.length() && (json[i] == ' ' || json[i] == '\t')) i++;
-    if (i >= (int)json.length() || json[i] != '"') return "";
+    while (i < json.size() && (json[i] == ' ' || json[i] == '\t')) i++;
+    if (i >= json.size() || json[i] != '"') return "";
     i++;
 
-    String out;
-    while (i < (int)json.length()) {
+    std::string out;
+    while (i < json.size()) {
         const char c = json[i];
-        if (c == '\\' && i + 1 < (int)json.length()) {
+        if (c == '\\' && i + 1 < json.size()) {
             const char n = json[++i];
             switch (n) {
             case 'n':  out += '\n'; break;
@@ -124,9 +134,9 @@ String httpExtractStringField(const String &json, const char *key)
             case 'u':
                 /* \uXXXX -> UTF-8。智谱返回的中文一般直接就是 UTF-8,
                    但转义形式也得能处理, 否则会冒出乱码 */
-                if (i + 4 < (int)json.length()) {
+                if (i + 4 < json.size()) {
                     const uint32_t cp =
-                        strtoul(json.substring(i + 1, i + 5).c_str(), nullptr, 16);
+                        strtoul(strSub(json, i + 1, i + 5).c_str(), nullptr, 16);
                     i += 4;
                     if (cp < 0x80) {
                         out += (char)cp;
@@ -153,14 +163,14 @@ String httpExtractStringField(const String &json, const char *key)
     return out;
 }
 
-String httpExtractContent(const String &json)
+std::string httpExtractContent(const std::string &json)
 {
     return httpExtractStringField(json, "content");
 }
 
-String httpJsonEscape(const char *s)
+std::string httpJsonEscape(const char *s)
 {
-    String out;
+    std::string out;
     for (const char *p = s; p && *p; p++) {
         if (*p == '"' || *p == '\\') out += '\\';
         out += *p;

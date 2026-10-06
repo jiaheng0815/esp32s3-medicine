@@ -1,3 +1,8 @@
+#include "logcfg.h"   /* 必须第一行: 日志配置要在 <Arduino.h> 之前生效 */
+#include "strutil.h"  // std::string 桥接
+
+static const char *TAG = "webui";    // 日志标签
+
 #include "webui.h"
 #include "med.h"
 #include "voice.h"
@@ -26,9 +31,9 @@ static const char PAGE_HEAD[] =
     "h3{margin:0 0 12px}h4{margin:24px 0 8px;color:#444}"
     ".hint{color:#888;font-size:13px}</style></head><body>";
 
-static String htmlEsc(const String &in)
+static std::string htmlEsc(const std::string &in)
 {
-    String out;
+    std::string out;
     out.reserve(in.length() + 8);
     for (size_t i = 0; i < in.length(); i++) {
         switch (in[i]) {
@@ -49,7 +54,7 @@ static void handleRoot()
     MedItem items[MED_MAX_ITEMS];
     const int n = medLoad(items, MED_MAX_ITEMS);
 
-    String page = PAGE_HEAD;
+    std::string page = PAGE_HEAD;
     page += "<h3>用药记录</h3>";
 
     /* 说话框 —— 按 BOOT 说话是主入口, 这里打字是麦克风没接/坏了时的降级入口,
@@ -65,8 +70,8 @@ static void handleRoot()
     if (vr.stamp) {
         page += "<h4>最近一次语音</h4>";
         if (vr.ok && vr.text[0])
-            page += "<p class='hint'>听到：「" + htmlEsc(String(vr.text)) + "」</p>";
-        page += "<p>" + htmlEsc(String(vr.reply)) + "</p>";
+            page += "<p class='hint'>听到：「" + htmlEsc(std::string(vr.text)) + "」</p>";
+        page += "<p>" + htmlEsc(std::string(vr.reply)) + "</p>";
     }
 
     if (n == 0) {
@@ -74,12 +79,12 @@ static void handleRoot()
     } else {
         page += "<table><tr><th>药品</th><th>方案</th><th>上次服用</th><th></th></tr>";
         for (int i = 0; i < n; i++) {
-            const String nm = htmlEsc(String(items[i].name));
+            const std::string nm = htmlEsc(std::string(items[i].name));
             page += "<tr><td><b>" + nm + "</b></td><td>";
             if (items[i].perDay) {
-                page += "一天 " + String((unsigned)items[i].perDay) + " 次";
+                page += "一天 " + std::to_string((unsigned)items[i].perDay) + " 次";
                 if (items[i].slots[0]) page += "<br><span class='hint'>" +
-                                               htmlEsc(String(items[i].slots)) + "</span>";
+                                               htmlEsc(std::string(items[i].slots)) + "</span>";
             } else {
                 page += "<span class='hint'>未设方案</span>";
             }
@@ -121,34 +126,34 @@ static void handleRoot()
     }
     page += "</body></html>";
 
-    s_server->send(200, "text/html; charset=utf-8", page);
+    s_server->send(200, "text/html; charset=utf-8", page.c_str());
 }
 
 /* ==================== 说一句 ==================== */
 static void handleSay()
 {
-    const String t = s_server->arg("t");
-    const String result = medHandleUtterance(t.c_str());
+    const std::string t = toStd(s_server->arg("t"));
+    const std::string result = medHandleUtterance(t.c_str());
 
-    Serial.printf("[MED] 输入「%s」-> %s\n", t.c_str(), result.c_str());
+    ESP_LOGI(TAG, "[MED] 输入「%s」-> %s", t.c_str(), result.c_str());
 
     /* 打字的也读出来 —— 这条路径本来就是给麦克风坏掉的情况兜底的,
        既然设备有喇叭, 结果就该能听见 */
     voiceSpeakAsync(result.c_str(), true);          // 用药提醒, 带免责
 
-    String page = PAGE_HEAD;
+    std::string page = PAGE_HEAD;
     page += "<h3>结果</h3>";
     page += "<p>" + htmlEsc(result) + "</p>";
     page += "<p class='hint'>用药决策请以医嘱和说明书为准。</p>";
     page += "<p><a href='/'>← 返回用药记录</a></p></body></html>";
-    s_server->send(200, "text/html; charset=utf-8", page);
+    s_server->send(200, "text/html; charset=utf-8", page.c_str());
 }
 
 /* ==================== 清空全部 ==================== */
 static void handleClear()
 {
     medClear();
-    Serial.println("[MED] 已清空全部用药记录");
+    ESP_LOGI(TAG, "[MED] 已清空全部用药记录");
     s_server->sendHeader("Location", "/", true);
     s_server->send(303, "text/plain", "");
 }
@@ -156,9 +161,9 @@ static void handleClear()
 /* ==================== 添加 / 修改 ==================== */
 static void handleAdd()
 {
-    String nm = s_server->arg("n");
-    nm.trim();
-    if (nm.isEmpty() || nm.length() >= MED_NAME_LEN) {
+    std::string nm = toStd(s_server->arg("n"));
+    strTrim(nm);
+    if (nm.empty() || nm.length() >= MED_NAME_LEN) {
         s_server->send(400, "text/html; charset=utf-8",
                        "<meta charset=utf-8><p>药名不能为空或过长。<a href=/>返回</a></p>");
         return;
@@ -168,11 +173,11 @@ static void handleAdd()
     if (pd < 1)  pd = 1;
     if (pd > 10) pd = 10;
 
-    String slots = s_server->arg("s");
-    slots.trim();
+    std::string slots = toStd(s_server->arg("s"));
+    strTrim(slots);
 
     const bool ok = medAdd(nm.c_str(), (uint8_t)pd, slots.c_str());
-    Serial.printf("[MED] %s 方案: 一天 %d 次 %s -> %s\n",
+    ESP_LOGI(TAG, "[MED] %s 方案: 一天 %d 次 %s -> %s",
                   nm.c_str(), pd, slots.c_str(), ok ? "已保存" : "保存失败");
 
     s_server->sendHeader("Location", "/", true);
@@ -182,9 +187,9 @@ static void handleAdd()
 /* ==================== 标记已服用 ==================== */
 static void handleTaken()
 {
-    const String nm = s_server->arg("n");
+    const std::string nm = toStd(s_server->arg("n"));
     const bool ok = medMarkTaken(nm.c_str());
-    Serial.printf("[MED] 标记服用: %s -> %s (时间 %s)\n",
+    ESP_LOGI(TAG, "[MED] 标记服用: %s -> %s (时间 %s)",
                   nm.c_str(), ok ? "已记录" : "没有这条记录",
                   medTimeReady() ? medFmtTime(medNow()).c_str() : "未同步");
 
@@ -195,9 +200,9 @@ static void handleTaken()
 /* ==================== 删除 ==================== */
 static void handleDel()
 {
-    const String nm = s_server->arg("n");
+    const std::string nm = toStd(s_server->arg("n"));
     const bool ok = medRemove(nm.c_str());
-    Serial.printf("[MED] 删除: %s -> %s\n", nm.c_str(), ok ? "已删" : "没有这条记录");
+    ESP_LOGI(TAG, "[MED] 删除: %s -> %s", nm.c_str(), ok ? "已删" : "没有这条记录");
 
     s_server->sendHeader("Location", "/", true);
     s_server->send(303, "text/plain", "");
@@ -237,7 +242,7 @@ void webuiBegin()
     });
 
     server.begin();
-    Serial.printf("[WEB] 用药记录页: http://%s\n", WiFi.localIP().toString().c_str());
+    ESP_LOGI(TAG, "[WEB] 用药记录页: http://%s", WiFi.localIP().toString().c_str());
 }
 
 void webuiLoop()

@@ -1,5 +1,6 @@
 #pragma once
 #include <Arduino.h>
+#include <string>
 
 /* 拍照 + 智谱 GLM 图像理解 —— 自包含, 不碰屏幕(tft)。
  * 摄像头相关的引脚和参数都在 vision.cpp, 屏幕相关的在 main.cpp。 */
@@ -23,8 +24,8 @@
 typedef void (*VisionStageCb)(const char *stage);
 
 struct VisionResult {
-    bool   ok;
-    String text;    // ok=true 时是模型答案; ok=false 时是中文错误描述
+    bool        ok;
+    std::string text;    // ok=true 时是模型答案; ok=false 时是中文错误描述
 };
 
 /* 初始化成取景模式 (RGB565 QVGA), main.cpp 启动时调一次 */
