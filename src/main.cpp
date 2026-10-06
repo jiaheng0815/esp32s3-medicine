@@ -87,6 +87,19 @@
 #define HW_TEST   0
 
 /* ============================================================
+ * 0.6 喇叭测试  ← 想验功放+喇叭就开这个
+ * ============================================================
+ * TTS_TEST = 1  开机连上 WiFi 之后, 用智谱 TTS 合成并播报下面这句话。
+ *
+ * 比自检里的 1kHz 蜂鸣更接近真实使用: 它把「联网 -> TTS 合成 -> WAV 解析
+ * -> I2S 输出 -> 功放 -> 喇叭」整条链路走了一遍, 有任何一环断了都听不到。
+ *
+ * 验完改成 0(它只在启动时播一次, 留着也不碍事, 但会拖慢开机几秒)。
+ * ⚠️ 需要联网, 且账户有余额(TTS 按字符计费)。 */
+#define TTS_TEST        1
+#define TTS_TEST_TEXT   "语音测试成功，galgame牛逼"
+
+/* ============================================================
  * 1. 屏幕 ST7735S 接线 (可改，避开摄像头用掉的 IO)
  * ============================================================ */
 #define TFT_SCLK_PIN   21
@@ -574,11 +587,36 @@ static void drawFps(uint32_t fps)
  * 结果打到串口然后停住, 不启 WiFi。排障用, 平时保持 0 */
 #define BENCH_CAPTURE   0
 
+/* ====================== TFT 互斥锁 ======================
+ * 语音 task 和主循环都会往屏幕上画 —— 语音的进度提示是走 onVoiceUi 回调
+ * 画上去的, 而 setup()/loop() 里也在画。
+ *
+ * ⚠️ Adafruit_SPITFT 不是线程安全的, 并发调用会把内部的窗口状态搞乱,
+ *    实测**卡死在 SPI 写入里再也出不来**。症状很有迷惑性:
+ *    设备不重启、串口没异常, 但语音 task 卡住 -> voiceBusy() 永远为真
+ *    -> 主循环每帧直接 return -> 连 [FPS] 都不打印, 看着像死机。
+ *
+ * 带超时: 拿不到锁就跳过这一帧的绘制。宁可少画一帧, 也不能把任务挂死。 */
+static SemaphoreHandle_t s_tftMux = nullptr;
+
+static bool tftLock(uint32_t ms = 3000)
+{
+    if (!s_tftMux) s_tftMux = xSemaphoreCreateMutex();
+    return s_tftMux && xSemaphoreTake(s_tftMux, pdMS_TO_TICKS(ms)) == pdTRUE;
+}
+
+static void tftUnlock()
+{
+    if (s_tftMux) xSemaphoreGive(s_tftMux);
+}
+
 /* ====================== 状态提示 ======================
- * 屏幕 160x128 且字体只有 ASCII, 所以这里只显示英文短句;
- * 模型返回的中文答案只走串口。 */
+ * 屏幕 160x128。这里只显示英文短句(内置字体, 快);
+ * 中文要画走 cnDrawWrapped()(16x16 点阵), 见 drawVoiceResult()。 */
 static void showStatus(const char *line1, const char *line2 = nullptr)
 {
+    if (!tftLock()) return;                 // 拿不到锁就跳过, 别把调用方挂死
+
     tft.fillRect(0, VIEW_Y, VIEW_W, VIEW_H, ST77XX_BLACK);
     tft.setTextSize(1);
     tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
@@ -589,6 +627,8 @@ static void showStatus(const char *line1, const char *line2 = nullptr)
         tft.setCursor(4, VIEW_Y + 22);
         tft.print(line2);
     }
+
+    tftUnlock();
 }
 
 static void onVisionStage(const char *stage)               { showStatus(stage); }
@@ -608,6 +648,7 @@ static void drawLevelBar(int level)
     const int h = 12;
 
     if (level == s_lastLevel) return;       // 没变就不刷, 省 SPI 带宽
+    if (!tftLock()) return;                 // 拿不到锁就跳过; 不更新 last, 下一帧自然会重试
     s_lastLevel = level;
 
     const uint16_t color = (level < 60) ? ST77XX_GREEN
@@ -616,6 +657,8 @@ static void drawLevelBar(int level)
     tft.fillRect(x + 1, y + 1, w - 2, h - 2, ST77XX_BLACK);
     if (level > 0) tft.fillRect(x + 1, y + 1, (w - 2) * level / 100, h - 2, color);
     tft.drawRect(x, y, w, h, ST77XX_WHITE);
+
+    tftUnlock();
 }
 
 /* cnDraw() 本身不换行(它只管一路画过去, 返回末尾的 x)。这里按宽度手工折行。
@@ -661,6 +704,8 @@ static void onVoiceUi(const char *l1, const char *l2, int level)
  * 这条很关键: 面向的是不方便看手机的场合, 结果只出现在网页上等于没用。 */
 static void drawVoiceResult(const char *heard, const char *reply)
 {
+    if (!tftLock()) return;
+
     tft.fillRect(0, VIEW_Y, VIEW_W, VIEW_H, ST77XX_BLACK);
     s_lastLevel = -1;
 
@@ -678,6 +723,8 @@ static void drawVoiceResult(const char *heard, const char *reply)
     }
 
     cnDrawWrapped(4, y, VIEW_W - 8, reply, ST77XX_YELLOW, CN_CHAR_H + 2);
+
+    tftUnlock();
 }
 
 /* ==================== 短按: 拍照识别药品 ====================
@@ -727,7 +774,7 @@ static void runCaptureAsk()
            才是主路径 —— 拍一下就知道该不该吃。
            走异步: 同步播的话这几秒里 webuiLoop() 停摆, 手机打不开网页,
            而结论恰恰要显示在网页上。 */
-        voiceSpeakAsync(advice.c_str());
+        voiceSpeakAsync(advice.c_str(), true);      // 用药结论, 带免责
 #else
         showStatus("See serial", nullptr);
 #endif
@@ -877,6 +924,10 @@ void setup()
        core 0 上是 cam_task(CONFIG_CAMERA_CORE0) 和 lwIP 协议栈 */
     Serial.printf("[SYS] 本固件的主循环跑在 core %d\n", xPortGetCoreID());
 
+    /* TFT 互斥锁在这里就建好, 别指望 tftLock() 里的懒初始化:
+       语音 task 和主循环可能同时第一次调用, 各自建一个 mutex = 等于没锁 */
+    s_tftMux = xSemaphoreCreateMutex();
+
     displayInit();
     bootSelfTest();
     if (bootHeld) panelTestLoop();
@@ -931,6 +982,19 @@ void setup()
     /* ---- 用药记录网页 ----
        麦克风没接/坏了时这是降级录入途径 —— 语音走的是同一条处理链路 */
     webuiBegin();
+
+#if TTS_TEST
+    /* ---- 喇叭测试 ----
+       用真实 TTS 播一句话: 把「联网 -> TTS 合成 -> WAV 解析 -> I2S -> 功放」
+       整条链路走一遍, 比 1kHz 蜂鸣更接近真实使用场景。
+
+       ⚠️ **不等它播完** —— 播报跑在语音 task 里(优先级 3, 高于 loopTask 的 1),
+       如果在这里同步等, 一旦 TTS 请求慢或卡住, 整个开机流程会被拖死
+       (实测卡过 40 秒不进主循环)。丢给后台就行, 结果看串口的 [TTS] 日志。 */
+    showStatus("TTS test", "listen to speaker");
+    Serial.printf("\n[TTS-TEST] 开始播报: %s\n", TTS_TEST_TEXT);
+    voiceSpeakAsync(TTS_TEST_TEXT);
+#endif
 #endif
 
     /* ---- NTP 对时 ----
@@ -988,11 +1052,14 @@ void loop()
 
         if (fb->format == PIXFORMAT_RGB565 &&
             fb->width >= VIEW_W && fb->height >= VIEW_H) {
-            buildView(fb);
-            pushView();
+            buildView(fb);                  // 只写内存, 不碰 TFT, 所以放在锁外
+            if (tftLock()) {                // 和语音 task 的屏幕操作串行化
+                pushView();
 #if SHOW_FPS
-            drawFps(g_fps);     // 每帧都重画, 否则会被下一帧盖掉
+                drawFps(g_fps);             // 每帧都重画, 否则会被下一帧盖掉
 #endif
+                tftUnlock();
+            }
             frames++;
         }
         esp_camera_fb_return(fb);

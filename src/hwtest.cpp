@@ -272,6 +272,15 @@ static bool testSpeaker(Adafruit_GFX &g)
         return false;
     }
 
+    /* 先灌满静音再开功放 —— 原因见 voice.cpp 的 playWavBuffer():
+       i2s_driver_install 之后 DMA 环形缓冲是未初始化的随机内存,
+       直接开功放会先放出一阵"嘟嘟"声(像摩斯电码), 然后才是正音。 */
+    {
+        static int16_t silence[256 * 2] = {0};
+        for (int i = 0; i < 10; i++)
+            i2sWriteAll((const uint8_t *)silence, sizeof(silence));
+    }
+
     ampOn(true);
     delay(5);
 

@@ -102,8 +102,12 @@ bool voiceBusy();
 /* 异步播报一句话, 立刻返回。
  * 拍照那条路(本地算出的用药结论)走这里 —— 不能同步播, 否则播报的几秒里
  * webuiLoop() 停摆, 手机打不开结果页, 而结果恰恰要显示在网页上。
- * 文本为空返回 true(什么都不做)。 */
-bool voiceSpeakAsync(const char *text);
+ * 文本为空返回 true(什么都不做)。
+ *
+ * addDisclaimer=true 会在末尾追加「以上仅供参考，请以医嘱和说明书为准」。
+ * 用药提醒该带这句(安全边界); 但测试语句之类的别加 —— 本来就不是医疗建议,
+ * 跟一句免责听着莫名其妙。所以默认 false, 由调用方显式决定。 */
+bool voiceSpeakAsync(const char *text, bool addDisclaimer = false);
 
 /* ---------- 结果 (给网页显示) ---------- */
 

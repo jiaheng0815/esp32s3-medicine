@@ -49,9 +49,15 @@ static const char ASR_HOTWORDS[] =
     "一天两次 一天三次 早晚各一次 吃了 吃过了 忘了";
 #endif
 
-/* TTS 播放缓冲: 一条 30 字提醒的 WAV 约 200KB, 512KB 留足余量。
+/* TTS 播放缓冲。
+ *
+ * ⚠️ 512KB **不够** —— 2026-10-06 实测: 一句 6 秒的「语音测试成功，你好世界，
+ * hello world」解出来正好撑满 512KB 还没完(共 162 个 chunk), 说明 GLM-TTS 返回的
+ * WAV 比按"24kHz 单声道 48KB/s"算出来的大得多(多半是立体声)。
+ * 给 2MB: 够 11 秒的 44.1kHz 立体声, PSRAM 也放得下。
+ *
  * 多分配 1 字节是为了出错时能塞个 '\0' 把响应体当字符串打出来。 */
-#define TTS_BUF_BYTES    (512 * 1024)
+#define TTS_BUF_BYTES    (2 * 1024 * 1024)
 #define TTS_MAX_CHARS    100            // 播报文本上限(按字符计费, 提醒本来就该短)
 
 /* 录音电平每块更新一次; 2048 字节 = 1024 采样 @16k = 64ms */
@@ -81,6 +87,7 @@ static VoiceResultCb     s_resultCb = nullptr;
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static char         s_pending[VOICE_REPLY_MAX];
 static volatile bool s_pendingReady = false;
+static volatile bool s_pendingDisclaimer = false;   // 本次播报要不要追加免责声明
 
 static VoiceResult   s_last = {};
 
@@ -341,19 +348,47 @@ static bool playWavBuffer(const uint8_t *wav, size_t len, bool interruptible)
         return false;
     }
 
+    const uint32_t bytesPerFrame = (wi.bits ? wi.bits / 8 : 2) * (wi.channels ? wi.channels : 1);
+    Serial.printf("[TTS] WAV: %u Hz, %u 声道, %u bit, 音频 %.1f 秒 (总 %u 字节)\n",
+                  (unsigned)wi.rate, (unsigned)wi.channels, (unsigned)wi.bits,
+                  (double)wi.dataLen / ((double)wi.rate * bytesPerFrame),
+                  (unsigned)len);
+
+    /* ★ 装 I2S 之前就先确保功放关断 —— 不能只指望"上次播报结束时会关":
+       万一上次是异常退出(中途 return false), 功放还开着, I2S 一上电的
+       那批 DMA 垃圾就会被直接放出来。 */
+    ampOn(false);
+    delay(10);
+    Serial.printf("[TTS] [%u ms] 功放已关断, 装 I2S\n", millis());
+
     if (!i2sInstallTx(wi.rate)) {
         Serial.println("[VOICE] I2S 播放模式安装失败");
         return false;
     }
 
-    ampOn(true);            // ★ 只有播报期间功放才使能
-    delay(5);               // 等功放起来, 免得吃掉开头
-
-    /* 起点先灌 20ms 静音压掉 POP(功放使能瞬间的爆音) */
+    /* ⚠️ 顺序不能反: 先把 I2S 环形缓冲整个灌满静音, **再**开功放。
+     *
+     * 三个因素叠在一起会放出一阵"嘟嘟"声(像摩斯电码):
+     *   ① i2s_driver_install() 之后 DMA 环形缓冲是**未初始化的随机内存**,
+     *      而 I2S 一启动就立刻开始"播放"它
+     *   ② 环形缓冲是 dma_buf_count × dma_buf_len = 8 × 256 帧 ≈ 8KB,
+     *      只灌一小段(原来的 20ms=1.9KB)根本盖不住, 剩下的垃圾照样漏出来
+     *   ③ 功放要是先使能, 这些垃圾就被直接放大了
+     * 所以: 灌满(20KB 远超 8KB) -> 再 ampOn。 */
     {
-        static int16_t silence[480 * 2] = {0};
-        i2sWriteAll((const uint8_t *)silence, sizeof(silence));
+        static int16_t silence[256 * 2] = {0};      // 256 帧立体声 = 1KB
+        size_t filled = 0;
+        for (int i = 0; i < 20; i++) {              // 20KB
+            i2sWriteAll((const uint8_t *)silence, sizeof(silence));
+            filled += sizeof(silence);
+        }
+        Serial.printf("[TTS] [%u ms] 静音已灌 %u 字节 (环形缓冲只有 8KB)\n",
+                      millis(), (unsigned)filled);
     }
+
+    ampOn(true);            // ★ 缓冲填满静音之后才使能功放
+    delay(10);
+    Serial.printf("[TTS] [%u ms] 功放已开, 开始播真实音频\n", millis());
 
     const uint8_t *pcm = wav + wi.dataOff;
     const size_t   n   = wi.dataLen;
@@ -404,6 +439,14 @@ static bool testTone(uint32_t freq, uint32_t ms)
 {
     const uint32_t rate = 24000;
     if (!i2sInstallTx(rate)) return false;
+
+    /* 同 playWavBuffer: 先灌满静音再开功放, 否则 DMA 环形缓冲里的
+       随机内存会先响一阵"嘟嘟"声, 然后才是正音 */
+    {
+        static int16_t silence[256 * 2] = {0};
+        for (int i = 0; i < 10; i++)
+            i2sWriteAll((const uint8_t *)silence, sizeof(silence));
+    }
 
     ampOn(true);
     delay(5);
@@ -575,46 +618,68 @@ static size_t readRawToBuffer(WiFiClientSecure &c, uint8_t *dst, size_t cap, uin
     return out;
 }
 
-/* 解 chunked 直接解进缓冲 —— httpDecodeChunked 吃 String, 不适合二进制 */
+/* 解 chunked 直接解进缓冲 —— httpDecodeChunked 吃 String, 不适合二进制。
+ *
+ * ⚠️ 除了"无进展超时"还加了**总时长保底**。之前只靠前者: 一旦 read() 返回 0
+ *    而 available() 又一直为真, 内层循环会空转, 永远出不来(实测卡死过,
+ *    而且症状是"设备不重启但彻底没反应", 极难查)。 */
 static size_t readChunkedToBuffer(WiFiClientSecure &c, uint8_t *dst, size_t cap, uint32_t idleMs)
 {
     size_t   out  = 0;
     uint32_t last = millis();
+    const uint32_t hardLimit = millis() + 90000;         // 总时长保底
+    int      chunks  = 0;
+    bool     timedOut = false;
 
     while (out < cap) {
+        if (millis() >= hardLimit) { timedOut = true; break; }
+
         if (!c.available()) {
             if (!c.connected()) break;
-            if (millis() - last > idleMs) break;
+            if (millis() - last > idleMs) { timedOut = true; break; }
             delay(5);
             continue;
         }
 
-        String line = c.readStringUntil('\n');      // chunk 长度行, 纯 ASCII
+        String line = c.readStringUntil('\n');           // chunk 长度行, 纯 ASCII
         line.trim();
         const long sz = strtol(line.c_str(), nullptr, 16);
-        if (sz <= 0) break;                          // 0 = 结束块
+        if (sz <= 0) break;                              // 0 = 结束块
+
+        chunks++;
+        if (chunks <= 4)                                 // 只报前几个, 免得刷屏
+            Serial.printf("[TTS] chunk#%d %ld 字节 (累计 %u)\n",
+                          chunks, sz, (unsigned)out);
 
         size_t got = 0;
         while (got < (size_t)sz) {
+            /* 内层也要有出口 —— 就是这里以前会空转 */
+            if (millis() >= hardLimit || millis() - last > idleMs) { timedOut = true; break; }
             if (!c.available()) {
                 if (!c.connected()) break;
-                if (millis() - last > idleMs) break;
                 delay(2);
                 continue;
             }
             size_t want = (size_t)sz - got;
             if (want > cap - out) want = cap - out;
+            if (want == 0) break;                        // 缓冲满了 —— 不加这句 read(ptr,0) 恒返回 0, 内层空转
             const int r = c.read(dst + out, want);
             if (r > 0) { out += r; got += r; last = millis(); }
         }
-        c.readStringUntil('\n');                     // 块尾的 \r\n
+        if (got < (size_t)sz) break;                     // 这一段没读全, 别再往下走
+        c.readStringUntil('\n');                         // 块尾的 \r\n
     }
+
+    Serial.printf("[TTS] chunked 解出 %u 字节, 共 %d 块%s\n",
+                  (unsigned)out, chunks, timedOut ? " (超时退出!)" : "");
     return out;
 }
 
-/* 播报文本的加工: 截断 + 免责。
- * 药品场景的安全边界 —— 输出要是"陈述 + 免责", 不是指令。 */
-static String speakTextFrom(const char *reply)
+/* 播报文本的加工: 截断 (+ 可选免责)。
+ * 免责是药品场景的安全边界 —— 输出要是"陈述 + 免责", 不是指令。
+ * 但它只对用药提醒有意义: 测试语句、纯记录类("已记下这次服用")跟一句
+ * "请以医嘱为准"听着莫名其妙。所以由调用方决定, 不在这里无差别追加。 */
+static String speakTextFrom(const char *reply, bool addDisclaimer)
 {
     String s(reply);
     s.trim();
@@ -628,11 +693,11 @@ static String speakTextFrom(const char *reply)
         s = s.substring(0, cut);
     }
 
-    s += "。以上仅供参考，请以医嘱和说明书为准。";
+    if (addDisclaimer) s += "。以上仅供参考，请以医嘱和说明书为准。";
     return s;
 }
 
-static bool ttsSpeak(const char *reply)
+static bool ttsSpeak(const char *reply, bool addDisclaimer)
 {
     if (!reply || !*reply) return true;
     if (WiFi.status() != WL_CONNECTED) {
@@ -641,17 +706,22 @@ static bool ttsSpeak(const char *reply)
     }
     if (!s_ttsBuf) return false;
 
-    const String say  = speakTextFrom(reply);
+    const String say  = speakTextFrom(reply, addDisclaimer);
     String body = "{\"model\":\"" TTS_MODEL "\",\"input\":\"";
     body += httpJsonEscape(say.c_str());
     body += "\",\"voice\":\"" TTS_VOICE "\",\"response_format\":\"wav\",\"speed\":1.0}";
 
     WiFiClientSecure client;
+    Serial.printf("[TTS] 文本 %u 字节, 请求体 %u 字节\n",
+                  (unsigned)say.length(), (unsigned)body.length());
     ui("Speaking...", nullptr, -1);
+
+    Serial.println("[TTS] TLS 连接中...");
     if (!httpConnect(client, ZHIPU_HOST, 443, TLS_TIMEOUT_S)) {
         Serial.println("[TTS] TLS 连接失败");
         return false;
     }
+    Serial.println("[TTS] TLS 已建立");
 
     client.printf("POST %s HTTP/1.1\r\n", TTS_PATH);
     client.printf("Host: %s\r\n", ZHIPU_HOST);
@@ -664,9 +734,11 @@ static bool ttsSpeak(const char *reply)
         Serial.println("[TTS] 请求体发送失败");
         return false;
     }
+    Serial.println("[TTS] 请求已发出, 等响应头 (最长 90 秒)...");
 
     bool chunked = false;
     const int code = httpReadHeader(client, chunked);
+    Serial.printf("[TTS] 响应码 %d, chunked=%d\n", code, (int)chunked);
 
     if (code != 200) {
         String err = httpReadBody(client, 10000);
@@ -837,17 +909,17 @@ static void recordAndHandle()
     storeResult(true, text.c_str(), reply.c_str());
 
     s_state = VS_SPEAK;
-    ttsSpeak(reply.c_str());
+    ttsSpeak(reply.c_str(), true);          // 用药提醒: 带免责
 
     if (s_resultCb) s_resultCb(text.c_str(), reply.c_str());
     s_state = VS_IDLE;
 }
 
-/* 只播报不录音 —— 拍照那条路(本地算出的用药结论)走这里 */
-static void speakOnly(const char *text)
+/* 只播报不录音 —— 拍照 / 网页打字那条路走这里 */
+static void speakOnly(const char *text, bool addDisclaimer)
 {
     s_state = VS_SPEAK;
-    ttsSpeak(text);
+    ttsSpeak(text, addDisclaimer);
     s_state = VS_IDLE;
 }
 
@@ -862,15 +934,17 @@ static void voiceTask(void *)
 
         char pending[VOICE_REPLY_MAX];
         bool hasPending = false;
+        bool disclaimer = false;
         portENTER_CRITICAL(&s_mux);
         if (s_pendingReady) {
             memcpy(pending, s_pending, sizeof(pending));
+            disclaimer     = s_pendingDisclaimer;
             s_pendingReady = false;
-            hasPending = true;
+            hasPending     = true;
         }
         portEXIT_CRITICAL(&s_mux);
 
-        if (hasPending) speakOnly(pending);
+        if (hasPending) speakOnly(pending, disclaimer);
         else            recordAndHandle();
     }
 }
@@ -935,13 +1009,14 @@ bool voiceBusy()
     return s_state != VS_IDLE;
 }
 
-bool voiceSpeakAsync(const char *text)
+bool voiceSpeakAsync(const char *text, bool addDisclaimer)
 {
     if (!text || !*text) return true;
     if (!s_sem) return false;
 
     portENTER_CRITICAL(&s_mux);
     strlcpy(s_pending, text, sizeof(s_pending));
+    s_pendingDisclaimer = addDisclaimer;
     s_pendingReady = true;
     portEXIT_CRITICAL(&s_mux);
 

@@ -171,6 +171,54 @@ ESP32-S3 的 GDMA 访问 PSRAM 要求 **16 字节对齐**（`SOC_GDMA_PSRAM_MIN_
 > 本机实测**是 `ONLY_LEFT` 才有数据**（`ONLY_RIGHT` 下全 `FFFE`）。
 > 这种结论只能两边都试一次才算数 —— `HW_TEST` 现在是固定的 `ONLY_LEFT`。
 
+### 13. TFT 不是线程安全的 —— 语音 task 和主循环会抢 SPI
+
+语音的进度提示（`Recording` / `Speaking...`）是**在语音 task 里**通过 `onVoiceUi`
+回调画到屏幕上的，而 `setup()` / `loop()` 也在画。`Adafruit_SPITFT` 没有任何同步。
+
+**症状极具迷惑性**：设备**不重启**、串口**没异常**、连 `[FPS]` 都不打了。
+真实原因是语音 task 卡死在 SPI 写入里 → `voiceBusy()` 永远为真 → 主循环每帧
+直接 `return`（连 FPS 统计都跳过）。**看着像死机，其实是两个任务把 SPI 状态搞乱了。**
+
+修法：`main.cpp` 的 `tftLock()/tftUnlock()` 把**所有**屏幕操作串行化 ——
+`showStatus` / `drawLevelBar` / `drawVoiceResult` / 取景的 `pushView`+`drawFps`。
+
+- 锁**必须带超时**（3 秒）：拿不到就跳过这一帧。宁可少画一帧，不能把任务挂死
+- 锁要在 `setup()` 里**显式创建**，不能靠懒初始化 —— 两个任务同时第一次调用会
+  各自建一个 mutex，等于没锁
+
+### 14. TTS 的 WAV 比想象中大得多 —— 512KB 缓冲会被撑爆
+
+2026-10-06 实测：一句 6 秒的「语音测试成功，你好世界，hello world」，
+GLM-TTS 返回的音频**撑满 512KB 还没完**（共 162 个 chunk）。
+
+按「24kHz 单声道 = 48KB/s」估算，6 秒只有 288KB —— 实际大了一倍以上，
+说明返回的是**立体声**（或更高采样率）。**别用理论值估缓冲大小，实测为准。**
+
+`voice.cpp` 的 `TTS_BUF_BYTES` 现在是 **2MB**（够 11 秒的 44.1kHz 立体声）。
+
+⚠️ **伴随的代码坑**：`readChunkedToBuffer()` 在缓冲满时会**空转** ——
+`want = cap - out` 变成 0，`c.read(ptr, 0)` 恒返回 0，内层 `while (got < sz)`
+永远出不来，只能等超时。症状同样是「设备不重启但彻底没反应」。
+修法要**两层都加**：`if (want == 0) break;` + 内层循环里的超时检查。
+
+### 15. 播放开头会"嘟嘟"一阵 —— DMA 缓冲是未初始化的内存
+
+现象：喇叭先放一段像**摩斯电码**的嘟嘟/咔咔声，然后才是正常语音。
+
+三个因素叠在一起：
+
+1. `i2s_driver_install()` 之后，DMA 环形缓冲是**未初始化的随机内存**，
+   而 I2S 一启动就立刻开始"播放"它 —— 24kHz 下随机数据听着就是一阵嘟嘟声
+2. 环形缓冲 = `dma_buf_count × dma_buf_len` = 8 × 256 帧 ≈ **8KB**；
+   只灌一小段静音（原来 20ms = 1.9KB）**盖不住**，剩下的垃圾照样漏出来
+3. 功放要是先 `ampOn(true)`，这些垃圾就被直接放大了
+
+**正确顺序**：先把整个环形缓冲灌满静音（灌 10KB > 8KB）→ **再**开功放。
+
+三处都要这么写：`voice.cpp` 的 `playWavBuffer()` / `testTone()`、
+`hwtest.cpp` 的 `testSpeaker()`。
+
 ## 调试工具
 
 代码里内置了几个开关，排障时比猜快得多：

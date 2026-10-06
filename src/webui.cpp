@@ -134,7 +134,7 @@ static void handleSay()
 
     /* 打字的也读出来 —— 这条路径本来就是给麦克风坏掉的情况兜底的,
        既然设备有喇叭, 结果就该能听见 */
-    voiceSpeakAsync(result.c_str());
+    voiceSpeakAsync(result.c_str(), true);          // 用药提醒, 带免责
 
     String page = PAGE_HEAD;
     page += "<h3>结果</h3>";
