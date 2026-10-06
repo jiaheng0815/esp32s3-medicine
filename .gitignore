@@ -1,0 +1,5 @@
+# PlatformIO 构建产物
+.pio/
+
+# 含 API Key, 绝不入库
+src/secrets.h
