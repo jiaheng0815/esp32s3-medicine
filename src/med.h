@@ -25,6 +25,17 @@ struct MedItem {
     uint8_t  perDay;                // 每天几次
     char     slots[MED_SLOT_LEN];   // 时段, 如 "morning,evening" (仅作展示)
     uint32_t lastTaken;             // 上次服用 unix 时间戳; 0 = 还没记录过
+
+    /* ---- 24 小时计数窗口 (2026-10-07 加) ----
+     * 为什么需要它: 只看 lastTaken 的间隔, **一天里均匀地吃 5 次也全都通过**
+     * (每次间隔都够) —— 管不住"总量超量"。所以另开一个 24 小时窗口单独计数。
+     *
+     * winStart = 窗口起点(第一笔的时间戳); 满 24 小时自动开新窗口、次数归零。
+     * ⚠️ 是个"锚定的 24 小时"而不是"滚动的 24 小时": 窗口一开就走 24 小时,
+     *    跨窗口的两笔不会互相计数。想改成滚动窗口得存每笔的时间戳(NVS 放不下),
+     *    或者改成按自然日(那要处理时区)。 */
+    uint32_t winStart;              // 计数窗口起点; 0 = 窗口还没开
+    uint8_t  cnt24;                 // 窗口内已记录几次
 };
 
 /* ---------- 基础读写 ---------- */
@@ -48,8 +59,36 @@ int  medFind(const char *name);
 /* 新增一条; 名字已存在则只更新规则, 不动服用记录 */
 bool medAdd(const char *name, uint8_t perDay, const char *slots);
 
-/* 记录一次服用 = 把 lastTaken 置为当前时间。返回 false 表示没这条药 */
-bool medMarkTaken(const char *name);
+/* 记录一次服用 = 打上当前网络时间戳 + 24 小时窗口计数 +1。
+ * outCount 非空时回填窗口内的次数(给网页/语音回话用: "24 小时内第 3 次")。
+ * 返回 false = 没这条药, 或者设备时间未同步(那种情况**拒绝记录**, 见实现)。 */
+bool medMarkTaken(const char *name, int *outCount = nullptr);
+
+/* 24 小时窗口内的次数; 窗口还没开或已经过期都返回 0。 */
+int  medCount24(const MedItem &it);
+
+/* 一次问出某味药的方案次数和窗口内次数(网页上判断"超量"用)。
+ * 找不到这条药返回 false。 */
+bool medUsage(const char *name, int *perDay, int *count24);
+
+/* ---------- 演示用 ----------
+ * 把所有记录的时间戳**整体往前挪** hours 小时 = 让设备以为过了这么久。
+ *
+ * 现场演示用: 「该吃了」「24 小时窗口过期」这些本来要等几小时的状态, 点一下就出来。
+ * 所有判断用的都是时间**差值**, 所以"把过去挪远"和"把现在推后"效果完全一样。
+ *
+ * ⚠️ 特意不碰系统时钟(那会影响 NTP 对时、TLS 证书校验), 也特意**往回挪**而不是
+ *    往前——写进未来的时间戳会在演示结束后把药"锁"住(一直显示"刚吃过"), 而
+ *    往回挪只留下一句无害的谎话, 下次真实记录就覆盖了。
+ * ⚠️ 它会改 NVS 里的真实记录。演示完想交作品, 把 webui.h 的 DEMO_HELPERS 改 0。
+ * 返回被影响的记录条数。 */
+int medDemoBackdate(uint32_t hours);
+
+/* 把计数清零 —— 网页上「清空次数」按钮走这里(记错了/重复点了)。
+ * ⚠️ 只清 cnt24, **不动 winStart, 也不动 lastTaken**:
+ *    winStart 留着 = "时间计时不变", 窗口还按原来的节奏走;
+ *    lastTaken 留着 = 「该不该吃」的间隔判断完全不受影响。 */
+bool medResetCount(const char *name);
 
 /* 删掉一条 */
 bool medRemove(const char *name);

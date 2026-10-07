@@ -119,9 +119,22 @@ static void handleRoot()
             else
                 page += medFmtTime(items[i].lastTaken);
 
+            /* 24 小时内吃了几次 —— 超了方案量就标红。这是"总量"那条线,
+               和「上次服用」的"间隔"那条线是两个独立的问题 */
+            const int used = medCount24(items[i]);
+            if (used > 0) {
+                /* ⚠️ 要有 perDay 才谈得上"超量" —— 拍照入库的药一开始是 0 次/天,
+                   那种把计数标红是误报 */
+                page += (items[i].perDay && used > (int)items[i].perDay)
+                      ? " <b style='color:#c00'>· " + std::to_string(used) + " 次(超量)</b>"
+                      : " <span class='hint'>· " + std::to_string(used) + " 次</span>";
+            }
+
             /* 确认弹窗里刻意不写药名 —— 药名里若含引号会把 JS 字符串截断 */
             page += "</td><td class='act'>"
                     "<a href='/taken?n=" + nmUrl + "'>吃了</a>"
+                    "<a href='/resetcount?n=" + nmUrl +
+                    "' onclick=\"return confirm('把 24 小时内的次数清零?')\">清空次数</a>"
                     "<a class='d' href='/del?n=" + nmUrl +
                     "' onclick=\"return confirm('确定删掉这条用药记录?')\">删除</a>"
                     "</td></tr>";
@@ -149,6 +162,16 @@ static void handleRoot()
                     "<span class='hint'>（模型认药名用的就是它）</span></p>";
         }
     }
+#if DEMO_HELPERS
+    /* 演示助手 —— 现场演示等不起真实时间, 点一下让记录"老"几小时 */
+    page += "<h4>演示助手</h4>"
+            "<p class='hint'>把已有记录的时间戳往前挪 = 让设备以为过了这么久。"
+            "系统时钟不动, 也不会写出未来的时间戳。</p>"
+            "<p class='act'><a href='/demo?h=6'>快进 6 小时</a>"
+            "<a href='/demo?h=12'>快进 12 小时</a>"
+            "<a href='/demo?h=25'>快进 25 小时(重置计数窗口)</a></p>";
+#endif
+
     /* 救屏入口 —— 面板被杜邦线抖白之后自己回不来, 这里是第二条命 */
     page += "<p class='act'><a href='/tftreset'>屏幕全白? 点这里重置屏幕</a>"
             "<span class='hint'>（重跑一次初始化, 黑屏约 1 秒）</span></p>";
@@ -218,7 +241,8 @@ static void handleAdd()
 static void handleTaken()
 {
     const std::string nm = toStd(s_server->arg("n"));
-    const bool ok = medMarkTaken(nm.c_str());
+    int cnt = 0;
+    const bool ok = medMarkTaken(nm.c_str(), &cnt);
     /* 失败有两种原因, 别都归成"没有这条记录" —— medMarkTaken 在设备时间
        没同步时会**拒绝写入**(照记会把上次的有效时间戳冲成 0, 之后间隔全算错) */
     ESP_LOGI(TAG, "[MED] 标记服用: %s -> %s (时间 %s)",
@@ -235,6 +259,66 @@ static void handleTaken()
               ? "记录里没有「" + htmlEsc(nm) + "」这条药。"
               : "设备时间还没同步(没连上 WiFi?), 记下来会算不准间隔, 所以先没记。";
         page += "</p><p><a href='/'>← 返回用药记录</a></p></body></html>";
+        s_server->send(200, "text/html; charset=utf-8", page.c_str());
+        return;
+    }
+
+    /* 超量了就别只是跳回首页 —— 那条最重要的提醒会被跳转吞掉 */
+    int perDay = 0;
+    medUsage(nm.c_str(), &perDay, nullptr);
+    if (perDay > 0 && cnt > perDay) {
+        std::string page = PAGE_HEAD;
+        page += "<h3 style='color:#c00'>超量了</h3><p>「" + htmlEsc(nm) +
+                "」24 小时内已经 " + std::to_string(cnt) + " 次, 超过方案的一天 " +
+                std::to_string(perDay) + " 次。</p>";
+        page += "<p class='hint'>如果这次是重复点的, 用「清空次数」把计数归零 —— "
+                "它只清次数, 计时和上次服用时间都不变。</p>";
+        page += "<p><a href='/'>← 返回用药记录</a></p></body></html>";
+        s_server->send(200, "text/html; charset=utf-8", page.c_str());
+        return;
+    }
+
+    s_server->sendHeader("Location", "/", true);
+    s_server->send(303, "text/plain", "");
+}
+
+/* ==================== 演示助手: 时间快进 ====================
+ * 「该吃了」要等间隔、「24 小时窗口过期」要等一天 —— 现场演示等不起,
+ * 点一下把已有记录的时间戳整体往前挪, 效果和"真过了这么久"一样。
+ * (为什么是往回挪而不是推后系统时钟, 见 med.h 的 medDemoBackdate 注释) */
+#if DEMO_HELPERS
+static void handleDemo()
+{
+    int h = s_server->arg("h").toInt();
+    if (h < 1 || h > 72) h = 0;              // 防呆: 只允许 1~72 小时
+    const int touched = h ? medDemoBackdate((uint32_t)h) : 0;
+    ESP_LOGW(TAG, "[DEMO] 时间快进 %d 小时 -> 影响 %d 条记录", h, touched);
+
+    std::string page = PAGE_HEAD;
+    page += "<h3>已快进 " + std::to_string(h) + " 小时</h3>";
+    page += "<p>影响 " + std::to_string(touched) + " 条记录。现在回到列表看结果。</p>";
+    page += "<p class='hint'>这只挪了记录里的时间戳, 设备的系统时钟没动 —— "
+            "所以断网重连、对时都不受影响。</p>";
+    page += "<p><a href='/'>← 返回用药记录</a></p></body></html>";
+    s_server->send(200, "text/html; charset=utf-8", page.c_str());
+}
+#endif
+
+/* ==================== 清空 24 小时次数 ====================
+ * 记错了 / 重复点了一次时用。
+ * ⚠️ 只清次数: 窗口起点(计时)和上次服用时间都不动 —— 所以它**不会**让
+ *    「该不该吃」的判断变松(那靠 lastTaken), 也不会延长这轮 24 小时窗口
+ *    (那靠 winStart)。就是"今天吃过几次"归零。 */
+static void handleResetCount()
+{
+    const std::string nm = toStd(s_server->arg("n"));
+    const bool ok = medResetCount(nm.c_str());
+    ESP_LOGI(TAG, "[MED] 清空次数: %s -> %s", nm.c_str(), ok ? "已清零" : "没有这条记录");
+
+    if (!ok) {
+        std::string page = PAGE_HEAD;
+        page += "<h3>没有这条记录</h3><p>「" + htmlEsc(nm) + "」不在用药记录里。</p>";
+        page += "<p><a href='/'>← 返回用药记录</a></p></body></html>";
         s_server->send(200, "text/html; charset=utf-8", page.c_str());
         return;
     }
@@ -286,7 +370,11 @@ void webuiBegin(void (*onTftReset)())
     server.on("/del",   HTTP_GET,  handleDel);
     server.on("/say",   HTTP_POST, handleSay);
     server.on("/clear", HTTP_GET,  handleClear);
-    server.on("/tftreset", HTTP_GET, handleTftReset);
+    server.on("/tftreset",   HTTP_GET, handleTftReset);
+    server.on("/resetcount", HTTP_GET, handleResetCount);
+#if DEMO_HELPERS
+    server.on("/demo",       HTTP_GET, handleDemo);
+#endif
 
     /* 最近一次拍的照片。正常模式下**不能**像 TEST 模式那样临时开
        另一个 80 端口服务器(两个 WebServer 抢同一端口会静默 bind 失败),

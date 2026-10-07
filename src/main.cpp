@@ -772,6 +772,9 @@ static const char ASK_PROMPT[] =
     "如果包装上的药名看不清或不确定，只回答三个字：看不清。";
 #endif
 
+/* 这两个是「拍照第二阶段」专用的 —— 用它的地方在 #if !IS_TEST 里,
+   所以自己也得跟着关, 否则 TEST 模式下就是两个没人用的 static(编译器会嚷)。 */
+#if !IS_TEST
 /* 模型答的不是药名时(「看不清」「无法确定」...)别往 medAdvice 里送。
  * 那条路会回一句「看不清: 还没录入用药方案」—— 把"没认出来"说成"没录入",
  * 用户照着去录入一条名叫"看不清"的药就更糟了。 */
@@ -823,6 +826,7 @@ static std::string cleanDrugName(const std::string &raw)
     }
     return s;
 }
+#endif  /* !IS_TEST */
 
 static void runCaptureAsk()
 {

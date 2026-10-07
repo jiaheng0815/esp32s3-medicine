@@ -14,6 +14,10 @@ static const char *TAG = "med";    // 日志标签
 /* NVS putString 上限 4000 字节, 留点余量 */
 #define MED_BLOB_MAX  3900
 
+/* 24 小时计数窗口的长度。⚠️ 是"锚定"的: 从这一轮第一笔开始算满 24 小时,
+   不是滚动的 24 小时 —— 见 med.h 里 MedItem 那段说明。 */
+#define MED_WINDOW_SEC  (24UL * 60 * 60)
+
 /* 整张表在这个静态缓冲里读写过一次。放静态区而不是栈上 ——
    3900 字节的栈数组会直接把 loopTask 的栈顶穿 */
 static char s_blob[MED_BLOB_MAX];
@@ -96,7 +100,11 @@ static bool saveBlob()
     return ok;
 }
 
-/* 解析一条 "名称|次数|时段|时间戳" */
+/* 解析一条 "名称|次数|时段|时间戳[|窗口起点|窗口内次数]"
+ *
+ * ⚠️ 最后两段(2026-10-07 加的 24 小时计数)**必须是可选的**:
+ *    NVS 里存着的是老格式的 4 段记录, 少两段就解析失败 = 用户存的药全没了。
+ *    这里 p4/p5 找不到就用 0(窗口没开), 新写的记录才带上它们。 */
 static bool parseRec(const char *rec, size_t len, MedItem *it)
 {
     /* 手动找三个分隔符, 避免构造临时 std::string */
@@ -123,6 +131,14 @@ static bool parseRec(const char *rec, size_t len, MedItem *it)
     }
 
     it->lastTaken = (uint32_t)strtoul(p3 + 1, nullptr, 10);
+
+    /* 可选的两段 */
+    const char *p4 = (const char *)memchr(p3 + 1, '|', len - (p3 + 1 - rec));
+    if (p4) {
+        it->winStart = (uint32_t)strtoul(p4 + 1, nullptr, 10);
+        const char *p5 = (const char *)memchr(p4 + 1, '|', len - (p4 + 1 - rec));
+        if (p5) it->cnt24 = (uint8_t)atoi(p5 + 1);
+    }
     return true;
 }
 
@@ -133,11 +149,13 @@ static bool saveItems(const MedItem *items, int n)
 
     for (int i = 0; i < n; i++) {
         char line[96];
-        const int m = snprintf(line, sizeof(line), "%s|%u|%s|%lu;",
+        const int m = snprintf(line, sizeof(line), "%s|%u|%s|%lu|%lu|%u;",
                                items[i].name,
                                (unsigned)items[i].perDay,
                                items[i].slots,
-                               (unsigned long)items[i].lastTaken);
+                               (unsigned long)items[i].lastTaken,
+                               (unsigned long)items[i].winStart,
+                               (unsigned)items[i].cnt24);
         if (m <= 0 || len + (size_t)m >= sizeof(s_blob)) {
             ESP_LOGI(TAG, "[MED] 记录超出 NVS 单值上限, 后面的被丢弃");
             break;
@@ -267,7 +285,30 @@ bool medAdd(const char *name, uint8_t perDay, const char *slots)
     return saveItems(items, n + 1);
 }
 
-bool medMarkTaken(const char *name)
+/* 24 小时窗口内的次数; 窗口没开、时间不可用、或窗口已过期都算 0 */
+int medCount24(const MedItem &it)
+{
+    const uint32_t now = medNow();
+    if (it.winStart == 0 || now == 0 || now < it.winStart) return 0;
+    if (now - it.winStart >= MED_WINDOW_SEC) return 0;
+    return it.cnt24;
+}
+
+/* 记一笔: 推进 24 小时窗口 + 更新 lastTaken。返回窗口内的新次数。 */
+static int countDose(MedItem &it, uint32_t now)
+{
+    /* 窗口没开 / 已经过期 / 时钟被回拨 -> 开一个新窗口, 次数从 0 开始 */
+    if (it.winStart == 0 || now < it.winStart ||
+        (now - it.winStart) >= MED_WINDOW_SEC) {
+        it.winStart = now;
+        it.cnt24    = 0;
+    }
+    if (it.cnt24 < 255) it.cnt24++;      // uint8 封顶, 免得回绕成 0
+    it.lastTaken = now;
+    return it.cnt24;
+}
+
+bool medMarkTaken(const char *name, int *outCount)
 {
     MedGuard g;
     if (!name || !*name) return false;
@@ -285,7 +326,75 @@ bool medMarkTaken(const char *name)
                 ESP_LOGW(TAG, "[MED] 时间未同步, 拒绝记录服用: %s", name);
                 return false;
             }
-            items[i].lastTaken = now;
+            const int c = countDose(items[i], now);
+            if (outCount) *outCount = c;
+            ESP_LOGI(TAG, "[MED] %s 记一次: 24 小时内第 %d 次 (方案一天 %u 次)",
+                          items[i].name, c, (unsigned)items[i].perDay);
+            return saveItems(items, n);
+        }
+    }
+    return false;
+}
+
+bool medUsage(const char *name, int *perDay, int *count24)
+{
+    MedGuard g;
+    if (!name || !*name) return false;
+
+    MedItem items[MED_MAX_ITEMS];
+    const int n = medLoad(items, MED_MAX_ITEMS);
+
+    for (int i = 0; i < n; i++) {
+        if (nameMatch(items[i].name, name)) {
+            if (perDay)  *perDay  = items[i].perDay;
+            if (count24) *count24 = medCount24(items[i]);
+            return true;
+        }
+    }
+    return false;
+}
+
+int medDemoBackdate(uint32_t hours)
+{
+    MedGuard g;
+    if (hours == 0) return 0;
+
+    const uint32_t sec = hours * 3600UL;
+
+    MedItem items[MED_MAX_ITEMS];
+    const int n = medLoad(items, MED_MAX_ITEMS);
+    if (n == 0) return 0;
+
+    int touched = 0;
+    for (int i = 0; i < n; i++) {
+        bool ch = false;
+        /* 用 > 而不是 >= : 免得减成负数/下溢 */
+        if (items[i].lastTaken > sec) { items[i].lastTaken -= sec; ch = true; }
+        if (items[i].winStart  > sec) { items[i].winStart  -= sec; ch = true; }
+        if (ch) touched++;
+    }
+
+    if (touched) saveItems(items, n);
+    ESP_LOGW(TAG, "[MED] 演示快进 %u 小时: 影响 %d 条 (只挪时间戳, 不动系统时钟)",
+                  (unsigned)hours, touched);
+    return touched;
+}
+
+bool medResetCount(const char *name)
+{
+    MedGuard g;
+    if (!name || !*name) return false;
+
+    MedItem items[MED_MAX_ITEMS];
+    const int n = medLoad(items, MED_MAX_ITEMS);
+
+    for (int i = 0; i < n; i++) {
+        if (nameMatch(items[i].name, name)) {
+            /* 只清 cnt24。winStart 和 lastTaken 都**不动**:
+               winStart 留着 -> "时间计时不变", 窗口还按原来的节奏走(到点自然归零);
+               lastTaken 留着 -> 「该不该吃」的间隔判断完全不受影响 */
+            items[i].cnt24 = 0;
+            ESP_LOGI(TAG, "[MED] 次数清零: %s (窗口起点保持不变)", items[i].name);
             return saveItems(items, n);
         }
     }
@@ -414,6 +523,17 @@ static std::string adviceFor(const MedItem &it)
                "。(设备时间未同步, 这次只记录不判断)";
     }
 
+    /* ---- 24 小时超量: 优先于"该不该吃" ----
+     * ⚠️ 必须放在间隔判断**前面**: 一天里均匀地吃 5 次, 每一次的间隔都是够的 ——
+     * 只看 lastTaken 拦不住, 只有总量能拦。这正是这个计数存在的理由。
+     * (间隔是"两次之间别太近", 计数是"一天别太多", 两个问题不一样) */
+    const int used = medCount24(it);
+    if (it.perDay && used > it.perDay) {
+        return std::string(it.name) + ": 24 小时内已经 " + std::to_string(used) +
+               " 次, 超过方案的一天 " + std::to_string(it.perDay) +
+               " 次了 —— 别再吃, 先确认一下。";
+    }
+
     /* ⚠️ 时钟回拨(NTP 重新对时 / 手动改时间)时 now < lastTaken,
        无符号相减会下溢成约 40 亿分钟 —— 直接把"刚吃过"判成"早该吃了"。
        这里宁可按"刚吃过"处理(保守方向): 少提醒一次不要紧, 凭空催人吃药不行。 */
@@ -429,8 +549,15 @@ static std::string adviceFor(const MedItem &it)
                " 次不该现在吃, 别重复。";
     }
     if ((uint64_t)elapsedMin * 10 >= (uint64_t)intervalMin * 8) {    // 达到间隔的 80%
+        /* 已经用满方案量的话, 在这句后面附一个次数提醒 —— 这正是用户准备再吃
+           一次的时刻, 次数最有参考价值 */
+        std::string quota;
+        if (it.perDay && used >= it.perDay) {
+            quota = " (24 小时内第 " + std::to_string(used) + " 次, 方案一天 " +
+                    std::to_string(it.perDay) + " 次)";
+        }
         return std::string(it.name) + ": 距上次 " + medFmtTime(it.lastTaken) + " 已 " +
-               elapsed + ", 按一天 " + std::to_string(it.perDay) + " 次该吃了。";
+               elapsed + ", 按一天 " + std::to_string(it.perDay) + " 次该吃了。" + quota;
     }
     return std::string(it.name) + ": 距上次 " + elapsed + ", 还不到时间, 再等等。";
 }
@@ -596,10 +723,19 @@ std::string medHandleUtterance(const char *text)
         if (now == 0) {
             return "设备时间还没同步(没连上 WiFi?), 这次先不记 —— 记下来也不准。";
         }
-        items[idx].lastTaken = now;
+        const int used = countDose(items[idx], now);
         if (!saveItems(items, n)) return "没存进去 (NVS 写入失败)。";
-        return std::string(items[idx].name) + ": 已记下这次服用 (" +
-               medFmtTime(now) + ")";
+
+        /* 每次都报一下 24 小时内的次数(用户要的就是这个反馈);
+           超过方案量就明确提醒 —— 间隔够**不代表**总量够 */
+        std::string msg = std::string(items[idx].name) + ": 已记下这次服用 (" +
+                          medFmtTime(now) + "), 24 小时内第 " + std::to_string(used) + " 次";
+        if (items[idx].perDay && used > items[idx].perDay) {
+            msg += " —— 超过方案的一天 " + std::to_string(items[idx].perDay) +
+                   " 次了, 注意别超量";
+        }
+        msg += "。";
+        return msg;
     }
 
     /* ⑤ 都不像, 当成查询 */
