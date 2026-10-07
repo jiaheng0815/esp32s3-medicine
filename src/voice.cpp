@@ -172,7 +172,7 @@ static uint32_t get32(const uint8_t *p)
  * 录音期间必须拉低 —— 见 voice.h 顶部关于自激的说明。 */
 static void ampOn(bool on)
 {
-    gpio_set_level((gpio_num_t)VOICE_PIN_AMP_SD, on ? 1 : 0);
+    gpio_set_level((gpio_num_t)I2S_PIN_AMP_SD, on ? 1 : 0);
 }
 
 /* ==================== I2S ====================
@@ -199,10 +199,10 @@ static bool i2sInstallRx()
 
     i2s_pin_config_t pin = {};
     pin.mck_io_num   = I2S_PIN_NO_CHANGE;
-    pin.bck_io_num   = VOICE_PIN_BCLK;
-    pin.ws_io_num    = VOICE_PIN_WS;
+    pin.bck_io_num   = I2S_PIN_BCLK;
+    pin.ws_io_num    = I2S_PIN_WS;
     pin.data_out_num = I2S_PIN_NO_CHANGE;   // RX 不驱动数据脚
-    pin.data_in_num  = VOICE_PIN_MIC_SD;
+    pin.data_in_num  = I2S_PIN_MIC_SD;
 
     if (i2s_set_pin(I2S_NUM_0, &pin) != ESP_OK) {
         i2s_driver_uninstall(I2S_NUM_0);
@@ -239,9 +239,9 @@ static bool i2sInstallTx(uint32_t rate)
 
     i2s_pin_config_t pin = {};
     pin.mck_io_num   = I2S_PIN_NO_CHANGE;
-    pin.bck_io_num   = VOICE_PIN_BCLK;
-    pin.ws_io_num    = VOICE_PIN_WS;
-    pin.data_out_num = VOICE_PIN_SPK_DIN;
+    pin.bck_io_num   = I2S_PIN_BCLK;
+    pin.ws_io_num    = I2S_PIN_WS;
+    pin.data_out_num = I2S_PIN_SPK_DIN;
     pin.data_in_num  = I2S_PIN_NO_CHANGE;   // TX 不读数据脚
 
     if (i2s_set_pin(I2S_NUM_0, &pin) != ESP_OK) {
@@ -480,7 +480,7 @@ static bool playWavBuffer(const uint8_t *wav, size_t len, bool interruptible)
             done += m;
 
             /* 播报中途按一下 BOOT 就能打断 —— 4~8 秒听着不能停会让人烦 */
-            if (interruptible && gpio_get_level((gpio_num_t)VOICE_PIN_BOOT) == 0) {
+            if (interruptible && gpio_get_level((gpio_num_t)BUTTON_PIN) == 0) {
                 ESP_LOGI(TAG, "[VOICE] 用户按键, 打断播报");
                 break;
             }
@@ -931,7 +931,7 @@ static void recordAndHandle()
 
         /* 松手就停 —— 这就是必须有独立 task 的原因:
            主循环的按键检测只有 ~15Hz, 而且拍照/上传期间干脆不跑 */
-        if (gpio_get_level((gpio_num_t)VOICE_PIN_BOOT) != 0) break;
+        if (gpio_get_level((gpio_num_t)BUTTON_PIN) != 0) break;
     }
 
     i2sUninstall();
@@ -1057,7 +1057,7 @@ bool voiceBegin(VoiceUiCb ui)
 
     /* 功放使能脚: 默认拉低(关), 只有播报时才开 */
     gpio_config_t amp = {};
-    amp.pin_bit_mask = 1ULL << VOICE_PIN_AMP_SD;
+    amp.pin_bit_mask = 1ULL << I2S_PIN_AMP_SD;
     amp.mode         = GPIO_MODE_OUTPUT;
     amp.pull_up_en   = GPIO_PULLUP_DISABLE;
     amp.pull_down_en = GPIO_PULLDOWN_ENABLE;    // 悬空/复位期间也保持关断
@@ -1161,14 +1161,14 @@ void voiceSelfTest()
     ESP_LOGI(TAG, "");
 
     for (;;) {
-        while (gpio_get_level((gpio_num_t)VOICE_PIN_BOOT) != 0) delay(20);   // 等按下
+        while (gpio_get_level((gpio_num_t)BUTTON_PIN) != 0) delay(20);   // 等按下
         delay(30);                                                          // 消抖
 
         ESP_LOGI(TAG, "[自检] 录音中... 松手结束");
         ampOn(false);                       // 录音期间关功放(自激)
         if (!i2sInstallRx()) {
             ESP_LOGI(TAG, "[自检] !! I2S 录音模式安装失败");
-            while (gpio_get_level((gpio_num_t)VOICE_PIN_BOOT) == 0) delay(20);
+            while (gpio_get_level((gpio_num_t)BUTTON_PIN) == 0) delay(20);
             continue;
         }
 
@@ -1189,12 +1189,12 @@ void voiceSelfTest()
                 updateStats(s_recBuf + VOICE_PCM_OFF + s_recPcmLen, got, rms);
                 s_recPcmLen += got;
             }
-            if (gpio_get_level((gpio_num_t)VOICE_PIN_BOOT) != 0) break;
+            if (gpio_get_level((gpio_num_t)BUTTON_PIN) != 0) break;
         }
         i2sUninstall();
 
         /* 等松手 —— 否则回放期间还按着的手会被当成下一次录音 */
-        while (gpio_get_level((gpio_num_t)VOICE_PIN_BOOT) == 0) delay(20);
+        while (gpio_get_level((gpio_num_t)BUTTON_PIN) == 0) delay(20);
 
         ESP_LOGI(TAG, "[自检] 录到 %u 字节 (%.1f 秒), 峰值 %u, 范围 [%d, %d], 非零 %u/%u",
                       (unsigned)s_recPcmLen,

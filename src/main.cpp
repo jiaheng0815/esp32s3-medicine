@@ -44,6 +44,7 @@
 #include <Adafruit_ST7735.h>
 #include "esp_camera.h"
 #include "esp_heap_caps.h"
+#include "pins.h"
 #include "netcfg.h"
 #include "vision.h"
 #include "med.h"
@@ -104,20 +105,15 @@ static const char *TAG = "main";    // ESP-IDF 日志标签
 #define TTS_TEST_TEXT   "语音测试成功，galgame牛逼"
 
 /* ============================================================
- * 1. 屏幕 ST7735S 接线 (可改，避开摄像头用掉的 IO)
- * ============================================================ */
-#define TFT_SCLK_PIN   21
-#define TFT_MOSI_PIN   14
-#define TFT_CS_PIN     47
-#define TFT_DC_PIN     48
-#define TFT_RST_PIN     1     // 没接 RES 就写 (-1)
-#define TFT_BL_PIN      2     // 没接 BLK 就接 3V3, 这里写 (-1)
+ * 1. 屏幕 ST7735S 接线
+ * ============================================================
+ * 引脚(TFT_SCLK/MOSI/CS/DC/RST/BL_PIN)全在 src/pins.h —— 和摄像头、I2S 放在一起,
+ * 换线只改那一个文件。这里只留不属于"引脚"的显示参数。 */
 #define TFT_BL_ACTIVE   HIGH
 #define TFT_ROTATION    1     // 1 或 3 = 横屏 160x128
 
-/* 板上 BOOT 键。放这么靠前是因为下面测试模式那段要用到它,
-   按键状态机那边的 BOOT_DEBOUNCE / BOOT_HOLD_MS 才是它的使用处。 */
-#define BOOT_PIN        0
+/* 按键引脚(BUTTON_PIN)在 src/pins.h —— 和屏幕/摄像头/I2S 放一起, 换引脚只改那一个文件。
+   下面测试模式那段要用到它, 所以引脚定义必须在那之前可见(靠 include)。 */
 
 /* 面板初始化变体: 纯白/花屏/偏移就换一个试 */
 #define TFT_TAB           INITR_BLACKTAB
@@ -268,9 +264,9 @@ static void displayInit()
 static bool testWaitButton()
 {
     for (;;) {
-        if (gpio_get_level((gpio_num_t)BOOT_PIN) == 0) {
+        if (gpio_get_level((gpio_num_t)BUTTON_PIN) == 0) {
             const uint32_t t0 = millis();
-            while (gpio_get_level((gpio_num_t)BOOT_PIN) == 0) {
+            while (gpio_get_level((gpio_num_t)BUTTON_PIN) == 0) {
                 if (millis() - t0 >= BTN_HOLD_TEST_MS) return true;
                 delay(10);
             }
@@ -610,7 +606,7 @@ static void drawFps(uint32_t fps)
 #endif
 
 /* ====================== 开关 ====================== */
-/* BOOT_PIN 见文件开头(测试模式那段要先用到它) */
+/* BUTTON_PIN 见 src/pins.h(测试模式那段也要用它, 所以定义在头文件里) */
 #define BOOT_DEBOUNCE   50      // 短于这个时长的抖动忽略 (ms)
 #define BTN_TAP_MAX     1200    // 松手时短于这个 = 短按(拍照); 按住超过它 = 录音
 #define BTN_DOUBLE_GAP  400     // 两次短按间隔小于这个 = 双击 -> 配网 (ms)
@@ -913,7 +909,7 @@ static void handleBootButton()
     static uint32_t firstTapUp = 0;       // 第一击松开的时刻; 0 = 没有挂起的单击
     static bool     wasBusy    = false;
 
-    const bool     now = (gpio_get_level((gpio_num_t)BOOT_PIN) == 0);
+    const bool     now = (gpio_get_level((gpio_num_t)BUTTON_PIN) == 0);
     const uint32_t t   = millis();
 
     /* ---- 语音会话进行中: 按键归语音 task ---- */
@@ -940,7 +936,7 @@ static void handleBootButton()
         /* 阻塞期间手可能又按下了 —— 等它松开。否则手还按着会被当成新的按下,
            接着按住又变成一次莫名其妙的录音 */
         const uint32_t t0 = millis();
-        while (gpio_get_level((gpio_num_t)BOOT_PIN) == 0 && millis() - t0 < 5000) delay(10);
+        while (gpio_get_level((gpio_num_t)BUTTON_PIN) == 0 && millis() - t0 < 5000) delay(10);
         down = false; holdFired = false;
         return;
     }
@@ -1025,16 +1021,16 @@ void setup()
     delay(200);
     ESP_LOGI(TAG, "=== ESP32-S3-CAM + ST7735S 取景器 ===");
 
-    /* IDF 写法, 等价于 pinMode(BOOT_PIN, INPUT_PULLUP) */
+    /* IDF 写法, 等价于 pinMode(BUTTON_PIN, INPUT_PULLUP) */
     gpio_config_t bootCfg = {};
-    bootCfg.pin_bit_mask = 1ULL << BOOT_PIN;
+    bootCfg.pin_bit_mask = 1ULL << BUTTON_PIN;
     bootCfg.mode         = GPIO_MODE_INPUT;
     bootCfg.pull_up_en   = GPIO_PULLUP_ENABLE;
     bootCfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
     bootCfg.intr_type    = GPIO_INTR_DISABLE;
     gpio_config(&bootCfg);
 
-    const bool bootHeld = (gpio_get_level((gpio_num_t)BOOT_PIN) == 0);
+    const bool bootHeld = (gpio_get_level((gpio_num_t)BUTTON_PIN) == 0);
     if (bootHeld) ESP_LOGI(TAG, "[SYS] 检测到 BOOT 按下 -> 纯屏幕测试模式");
 
     ESP_LOGI(TAG, "[SYS] PSRAM: %u KB, 可用堆: %u KB",

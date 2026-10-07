@@ -41,8 +41,11 @@ INMP441 --(I2S RX @16k)--> PSRAM WAV 缓冲 --(multipart)--> 智谱 glm-asr-2512
 
 ### 文件分工
 
+- `pins.h` — **全项目引脚定义**（屏幕 ST7735S / 摄像头 OV3660 / I2S 麦克风+功放 / 按键），换线只改这一个文件。
+  按键统一叫 `BUTTON_PIN`（默认 `0` = 板上 BOOT 键），`main.cpp` 的按键状态机和 `voice.cpp` 的录音松手检测共用它
+  ⚠️ 换按键引脚前先看 `pins.h` 里的三条警告：别选 strapping 脚（3/45/46）、别选已占用的脚、GPIO0 上电被拉低会进下载模式
 - `main.cpp` — 屏幕、取景、按键状态机（三手势）、运行模式开关（`IS_TEST`）、中文上屏
-- `vision.cpp` — 摄像头引脚 + 取景/拍照两套模式参数、软件 JPEG、智谱视觉 API
+- `vision.cpp` — 取景/拍照两套模式参数（引脚见 `pins.h`）、软件 JPEG、智谱视觉 API
 - `voice.cpp` — **语音链路**：I2S 录音(INMP441) → ASR 上传 → 本地判断 → TTS 播报(MAX98357A)，含电平条和静音检测
 - `hwtest.cpp` — 麦克风/屏幕/功放的**基础测试**（屏幕上直接画声波），`HW_TEST` 开关触发
 - `httpio.cpp` — 共享 HTTPS 传输层（**分块写满 `httpWriteAllChunk`** / 读响应头 / chunked 解码 / 取 JSON 字段），拍照和语音共用；**分块大小有讲究，见坑 #16**

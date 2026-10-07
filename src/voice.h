@@ -1,11 +1,12 @@
 #pragma once
 #include <Arduino.h>
+#include "pins.h"     // I2S_PIN_* (原来在这个头里, 现在和屏幕/摄像头放一起)
 
 /* 语音链路 —— INMP441 录音 + 智谱 ASR 转写 + GLM-TTS 播报 + MAX98357A 放音。
  *
  * 两个模块共用 BCLK/WS 两根时钟线, 分时切换 I2S 方向:
- *     录音: RX @16kHz, data_in  = GPIO40 (INMP441 的 SD)
- *     播报: TX @24kHz, data_out = GPIO39 (MAX98357A 的 DIN)
+ *     录音: RX @16kHz, data_in  = I2S_PIN_MIC_SD  (INMP441 的 SD)
+ *     播报: TX @24kHz, data_out = I2S_PIN_SPK_DIN (MAX98357A 的 DIN)
  * 任何时刻只有一个 I2S 存在, 所以既不会和摄像头争 GDMA,
  * 也不用担心喇叭的声音被麦克风录进去。
  *
@@ -17,17 +18,14 @@
  *    再被 INMP441 录回去(自激)。所以功放的 SD/EN 必须能被软件关掉:
  *    走 GPIO38, 只有播报时才拉高。 */
 
-/* ---------- 引脚 (换脚改这里; 注意 3/45/46 是 strapping 脚, 别用) ---------- */
-#define VOICE_PIN_BCLK    41        // 共用位时钟  -> INMP441 SCK / MAX98357A BCLK
-#define VOICE_PIN_WS      42        // 共用帧同步  -> INMP441 WS  / MAX98357A LRC
-#define VOICE_PIN_MIC_SD  40        // 麦克风数据  -> INMP441 SD
-#define VOICE_PIN_SPK_DIN 39        // 功放数据    -> MAX98357A DIN
-#define VOICE_PIN_AMP_SD  38        // 功放使能    -> MAX98357A SD/EN (拉高才工作)
+/* ---------- 引脚 ----------
+ * I2S 那五个脚(I2S_PIN_*)搬到了 src/pins.h, 和屏幕、摄像头放一起 ——
+ * 以前这里和 hwtest.cpp 各抄一份, 换脚改漏一处就会出现
+ * 「屏幕正常但麦克风没数据」这种极难查的现象。换脚请改 pins.h。 */
 
-/* BOOT 按键 —— 和 main.cpp 的 BOOT_PIN 是同一个脚。
- * 录音 task 要自己高频轮询它来检测"松手", 所以这里也得有一份。
- * ⚠️ 改 main.cpp 的 BOOT_PIN 时这里要一起改。 */
-#define VOICE_PIN_BOOT    0
+/* 按键(BUTTON_PIN)也在 src/pins.h —— 录音 task 要自己高频轮询它来检测"松手",
+ * 以前这里和 main.cpp 各写死一个 0, 换引脚时改漏一处就变成「录音松不开手」。
+ * 现在全项目只有 pins.h 一处定义。 */
 
 /* ---------- 录音参数 ---------- */
 #define VOICE_RATE_HZ     16000     // INMP441 用 16k; GLM-ASR 也吃这个采样率

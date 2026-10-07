@@ -2,6 +2,7 @@
 
 static const char *TAG = "hwtest";    // 日志标签
 
+#include "pins.h"
 #include "hwtest.h"
 #include "cnfont.h"
 
@@ -15,13 +16,9 @@ static const char *TAG = "hwtest";    // 日志标签
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ==================== 引脚 ====================
- * ⚠️ 必须和 voice.h 一致 —— 这是同一套硬件, 换脚要两处一起改。 */
-#define HT_PIN_BCLK     41      // 共用位时钟 -> INMP441 SCK / MAX98357A BCLK
-#define HT_PIN_WS       42      // 共用帧同步 -> INMP441 WS  / MAX98357A LRC
-#define HT_PIN_MIC_SD   40      // INMP441 SD
-#define HT_PIN_SPK_DIN  39      // MAX98357A DIN
-#define HT_PIN_AMP_SD   38      // MAX98357A SD/EN, 拉高才工作
+/* 引脚用 src/pins.h 里的 I2S_PIN_* —— 和 voice.cpp 是同一套硬件,
+   以前这里各自抄一份, 换脚改漏一处就变成「屏幕正常但麦克风没数据」。
+   ⚠️ 屏幕上的提示文字别手写脚号, 用 PIN_STR(...) 自动跟宏走。 */
 
 #define HT_RATE_HZ      16000   // 麦克风采样率
 #define HT_BLOCK_BYTES  2048    // 一次读 64ms 音频(1024 采样)
@@ -47,13 +44,13 @@ static const uint16_t C_YELLOW = 0xFFE0;
  * 再被麦克风录回去(自激)。所以测试音放完必须立刻关掉。 */
 static void ampOn(bool on)
 {
-    gpio_set_level((gpio_num_t)HT_PIN_AMP_SD, on ? 1 : 0);
+    gpio_set_level((gpio_num_t)I2S_PIN_AMP_SD, on ? 1 : 0);
 }
 
 static void ampInit()
 {
     gpio_config_t g = {};
-    g.pin_bit_mask = 1ULL << HT_PIN_AMP_SD;
+    g.pin_bit_mask = 1ULL << I2S_PIN_AMP_SD;
     g.mode         = GPIO_MODE_OUTPUT;
     g.pull_down_en = GPIO_PULLDOWN_ENABLE;      // 复位期间也保持关断
     gpio_config(&g);
@@ -71,11 +68,11 @@ static void ampInit()
 static void probePins()
 {
     struct { int pin; const char *name; } list[] = {
-        { HT_PIN_MIC_SD,  "MIC_SD  (40)" },
-        { HT_PIN_BCLK,    "BCLK    (41)" },
-        { HT_PIN_WS,      "WS      (42)" },
-        { HT_PIN_SPK_DIN, "SPK_DIN (39)" },
-        { HT_PIN_AMP_SD,  "AMP_SD  (38)" },
+        { I2S_PIN_MIC_SD,  "MIC_SD  (" PIN_STR(I2S_PIN_MIC_SD)  ")" },
+        { I2S_PIN_BCLK,    "BCLK    (" PIN_STR(I2S_PIN_BCLK)    ")" },
+        { I2S_PIN_WS,      "WS      (" PIN_STR(I2S_PIN_WS)      ")" },
+        { I2S_PIN_SPK_DIN, "SPK_DIN (" PIN_STR(I2S_PIN_SPK_DIN) ")" },
+        { I2S_PIN_AMP_SD,  "AMP_SD  (" PIN_STR(I2S_PIN_AMP_SD)  ")" },
     };
 
     ESP_LOGI(TAG, "\n[HW ⓪] 引脚静态电平探测");
@@ -137,10 +134,10 @@ static bool i2sRxOn(i2s_channel_fmt_t fmt)
 
     i2s_pin_config_t pin = {};
     pin.mck_io_num   = I2S_PIN_NO_CHANGE;
-    pin.bck_io_num   = HT_PIN_BCLK;
-    pin.ws_io_num    = HT_PIN_WS;
+    pin.bck_io_num   = I2S_PIN_BCLK;
+    pin.ws_io_num    = I2S_PIN_WS;
     pin.data_out_num = I2S_PIN_NO_CHANGE;    // RX 不驱动数据脚
-    pin.data_in_num  = HT_PIN_MIC_SD;
+    pin.data_in_num  = I2S_PIN_MIC_SD;
 
     if (i2s_set_pin(I2S_NUM_0, &pin) != ESP_OK) {
         i2s_driver_uninstall(I2S_NUM_0);
@@ -168,9 +165,9 @@ static bool i2sTxOn(uint32_t rate)
 
     i2s_pin_config_t pin = {};
     pin.mck_io_num   = I2S_PIN_NO_CHANGE;
-    pin.bck_io_num   = HT_PIN_BCLK;
-    pin.ws_io_num    = HT_PIN_WS;
-    pin.data_out_num = HT_PIN_SPK_DIN;
+    pin.bck_io_num   = I2S_PIN_BCLK;
+    pin.ws_io_num    = I2S_PIN_WS;
+    pin.data_out_num = I2S_PIN_SPK_DIN;
     pin.data_in_num  = I2S_PIN_NO_CHANGE;
 
     if (i2s_set_pin(I2S_NUM_0, &pin) != ESP_OK) {

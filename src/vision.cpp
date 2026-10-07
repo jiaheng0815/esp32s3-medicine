@@ -3,6 +3,7 @@
 
 static const char *TAG = "vision";    // 日志标签
 
+#include "pins.h"
 #include "vision.h"
 #include "secrets.h"
 #include "httpio.h"
@@ -18,23 +19,8 @@ static const char *TAG = "vision";    // 日志标签
 #error "缺少 src/secrets.h —— 里面要定义 ZHIPU_API_KEY"
 #endif
 
-/* ==================== 摄像头接线 (一般不用改) ==================== */
-#define CAM_PIN_PWDN    (-1)
-#define CAM_PIN_RESET   (-1)
-#define CAM_PIN_XCLK    15
-#define CAM_PIN_SIOD     4
-#define CAM_PIN_SIOC     5
-#define CAM_PIN_D7      16
-#define CAM_PIN_D6      17
-#define CAM_PIN_D5      18
-#define CAM_PIN_D4      12
-#define CAM_PIN_D3      10
-#define CAM_PIN_D2       8
-#define CAM_PIN_D1       9
-#define CAM_PIN_D0      11
-#define CAM_PIN_VSYNC    6
-#define CAM_PIN_HREF     7
-#define CAM_PIN_PCLK    13
+/* 摄像头引脚(CAM_PIN_*)搬到了 src/pins.h —— 和屏幕、I2S 放一起, 换线只改一处。
+   这里往下就只剩「取景 / 拍照」两套模式参数了。 */
 
 /* ==================== 取景 / 拍照 参数 ==================== */
 /* OV3660 驱动在非 JPEG 格式下是按 16MHz XCLK 调的, 别乱改 */
