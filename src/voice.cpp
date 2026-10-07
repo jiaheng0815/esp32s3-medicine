@@ -32,27 +32,80 @@ static const char *TAG = "voice";    // 日志标签
    所以哪怕把音频 base64 后拼进来也不会撞上 */
 #define ASR_BOUNDARY     "----esp32s3camASR7f3a91"
 
-/* 热词 —— 提高药名这种专有名词的识别率。
- * 刻意**不用用户自己的药单**: 那等于把健康信息随每次请求发给智谱,
- * 而换成通用词表后识别率的损失很小(常见药名就那些)。
+/* ==================== ASR 热词 ====================
+ * 提高药名这种专有名词的识别率。
  *
- * ⚠️ 格式(JSON 数组 vs 空格分隔)没法离线确认。第一次上机如果服务端回 400
- *    抱怨 hotwords, 把下面这个开关改成 0 再试。 */
-#define ASR_HOTWORDS_JSON 1
+ * ⚠️ 2026-10-07 实测: 「苯磺酸氨氯地平片」被识别成「酸氯环利晴片」, 而**内置表里
+ *    本来就有「氨氯地平」** —— 所以要么热词被服务端静默忽略了, 要么力度不够。
+ *    下面这三档就是用来把这件事测清楚的:
+ *
+ *      0 = 不发 hotwords 字段   ← **对照实验**: 同一句话录两遍, 看转写有没有变化。
+ *                                 没变化 = 服务端压根没理这个参数, 别再指望它
+ *      1 = JSON 数组  ["阿莫西林"]  ← 接口文档(2026-10-07 核实)写的是 array, maxItems 100
+ *      2 = 逗号分隔   阿莫西林,      ← 社区工具(zhipu-asr)用的写法
+ *
+ * 另外, 热词表 = **设备里自己存的药名** + 内置常用词。
+ * 这里以前刻意不用用户药单, 理由是"别把健康信息随每次请求发给智谱"——
+ * 那个理由其实早就不成立了: 药名已经有三条路进到智谱(药盒照片走 glm-4.6v、
+ * 播报文本走 GLM-TTS、还有**用户嘴上说的那一句**, 就在同一个 ASR 请求的音频里)。
+ * 而药名恰恰是热词最该起作用的地方 —— 用户会说的, 基本就是他表里存的那些。
+ * (不想发就把 ASR_HOTWORDS_FMT 设成 0, 一并不发。) */
+#define ASR_HOTWORDS_FMT  1
 
-#if ASR_HOTWORDS_JSON
-static const char ASR_HOTWORDS[] =
-    "[\"阿莫西林\",\"头孢\",\"阿奇霉素\",\"左氧氟沙星\",\"布洛芬\",\"对乙酰氨基酚\","
-    "\"阿司匹林\",\"二甲双胍\",\"格列美脲\",\"阿托伐他汀\",\"氨氯地平\",\"缬沙坦\","
-    "\"美托洛尔\",\"硝苯地平\",\"奥美拉唑\",\"蒙脱石散\",\"氯雷他定\",\"感冒灵\","
-    "\"维生素\",\"钙片\",\"一天两次\",\"一天三次\",\"早晚各一次\",\"饭前\",\"饭后\","
-    "\"吃了\",\"吃过了\",\"忘了\"]";
+#if ASR_HOTWORDS_FMT
+/* 常见说法(药名本身从 med 的 medCommonDrugs() 取, 一处定义两处用) */
+static const char *const kAsrPhraseWords[] = {
+    "一天两次", "一天三次", "早晚各一次", "饭前", "饭后",
+    "吃了", "吃过了", "忘了",
+};
+
+/* 拼热词表: **用户存过的药名排前面**(最可能被说出口的), 再补内置药名和常见说法。
+ * ⚠️ 要去重 —— 表里存了「阿莫西林」时它会和内置表撞, 实测日志里就出现过
+ *    ["阿莫西林","阿莫西林",...]。重复热词纯属浪费额度。 */
+static std::string buildHotwords()
+{
+    /* ⚠️ 只取 16 条, 不用 MED_MAX_ITEMS(40): 那是 2240 字节的栈数组, 而这条路径
+       跑在语音 task 里(栈 12KB, 底下调用链也不浅)。16 条够覆盖家庭用药了。 */
+    MedItem items[16];
+    const int n = medLoad(items, 16);
+
+    std::string out;
+    const char *seen[100];
+    int cnt = 0;
+
+    auto add = [&](const char *w) {
+        if (!w || !*w) return;
+        for (int i = 0; i < cnt; i++) {
+            if (strcmp(seen[i], w) == 0) return;      // 去重
+        }
+        if (cnt >= 100) return;                       // 接口上限 maxItems: 100
+        if (cnt) out += ',';
+#if ASR_HOTWORDS_FMT == 1
+        out += '"';
+        out += w;
+        out += '"';
 #else
-static const char ASR_HOTWORDS[] =
-    "阿莫西林 头孢 阿奇霉素 左氧氟沙星 布洛芬 对乙酰氨基酚 阿司匹林 二甲双胍 "
-    "氨氯地平 硝苯地平 奥美拉唑 蒙脱石散 氯雷他定 感冒灵 维生素 钙片 "
-    "一天两次 一天三次 早晚各一次 吃了 吃过了 忘了";
+        out += w;
 #endif
+        seen[cnt++] = w;
+    };
+
+    for (int i = 0; i < n; i++) add(items[i].name);
+
+    int cdN = 0;
+    const char *const *cd = medCommonDrugs(&cdN);
+    for (int i = 0; i < cdN; i++) add(cd[i]);
+
+    for (size_t i = 0; i < sizeof(kAsrPhraseWords) / sizeof(kAsrPhraseWords[0]); i++)
+        add(kAsrPhraseWords[i]);
+
+#if ASR_HOTWORDS_FMT == 1
+    return "[" + out + "]";
+#else
+    return out;                                   // 逗号分隔, 本身就是拼好的
+#endif
+}
+#endif  /* ASR_HOTWORDS_FMT */
 
 /* TTS 播放缓冲。
  *
@@ -524,6 +577,16 @@ static std::string mpTail()
     return s;
 }
 
+/* ⚠️ 上传分块**必须小** —— 见 CLAUDE.md 坑 #16。
+ * 本 core 的 mbedtls 出方向只要单个 TLS 记录"大"到一定程度(实测 ≥1350 字节)
+ * 就会被对端静默掐死, 而 httpWriteAll() 的默认块是 HTTP_WRITE_CHUNK=4096,
+ * 直接拿它传录音**必挂**, 日志长这样(2026-10-07 实测):
+ *   [写] 首次受阻: 已发 4096/143360 字节, connected=0, errno=11
+ *   [ASR] 请求体写到一半断了 (已发 818 / 144211 字节)
+ * 64 是实测最小可用值, 和 vision.cpp 的 uploadChunkGuess 保持一致。
+ * 代价是慢: 设备上行天花板约 12KB/s, 144KB 的录音要约 12 秒。 */
+#define ASR_UPLOAD_CHUNK 64
+
 /* 上传录音拿转写结果。
  * 用 file 分片而不是 file_base64: 省掉一份 427KB 的 base64 缓冲。 */
 static bool asrTranscribe(const uint8_t *recBuf, size_t pcmLen, std::string &outText)
@@ -533,7 +596,16 @@ static bool asrTranscribe(const uint8_t *recBuf, size_t pcmLen, std::string &out
     std::string prefix;
     prefix += mpTextField("model", ASR_MODEL);
     prefix += mpTextField("stream", "false");
-    prefix += mpTextField("hotwords", ASR_HOTWORDS);
+#if ASR_HOTWORDS_FMT
+    const std::string hw = buildHotwords();
+    /* 把实际发出去的热词原样打出来 —— 上机时一眼就能确认"到底发没发、格式对不对",
+       不用靠猜(这条就是被"表里有氨氯地平却还是听错"逼出来的) */
+    ESP_LOGI(TAG, "[ASR] hotwords(%u 字节): %s", (unsigned)hw.size(), hw.c_str());
+    prefix += mpTextField("hotwords", hw.c_str());
+#else
+    /* 对照档: 完全不发 hotwords 字段, 用来判断服务端到底认不认这个参数 */
+    ESP_LOGI(TAG, "[ASR] hotwords: 关闭(对照实验)");
+#endif
 
     const std::string fileHead = mpFileHead();
     const std::string tail     = mpTail();
@@ -568,7 +640,7 @@ static bool asrTranscribe(const uint8_t *recBuf, size_t pcmLen, std::string &out
 
     auto wr = [&](const uint8_t *p, size_t n) {
         if (!ok) return;
-        if (!httpWriteAll(client, p, n)) { ok = false; return; }
+        if (!httpWriteAllChunk(client, p, n, ASR_UPLOAD_CHUNK)) { ok = false; return; }
         sent += n;
     };
 
@@ -1002,7 +1074,10 @@ bool voiceBegin(VoiceUiCb ui)
     /* core 1、优先级 3: core 0 上已经有 cam_task 和 lwIP; 优先级高于 loopTask(1),
        远低于 WiFi 的 ~23, 只在语音会话那几秒真正占用。
        栈给 8192: TLS 握手的调用链很深。 */
-    if (xTaskCreatePinnedToCore(voiceTask, "voice", 8192, nullptr, 3, nullptr, 1) != pdPASS) {
+    /* ⚠️ 栈给到 12KB。这条 task 里最深的一条路是 medHandleUtterance/adviceFor,
+       那里有一个 2240 字节的 MedItem 数组(见 med.cpp), 再加上 std::string 和
+       一层层 ESP_LOG —— 8KB 时余量已经不多, 栈溢出又只表现为莫名其妙的崩溃。 */
+    if (xTaskCreatePinnedToCore(voiceTask, "voice", 12288, nullptr, 3, nullptr, 1) != pdPASS) {
         ESP_LOGI(TAG, "[VOICE] 语音 task 创建失败");
         return false;
     }

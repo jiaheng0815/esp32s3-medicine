@@ -17,6 +17,9 @@
  * 内部带断连检测和「10 秒无进展」超时。 */
 bool httpWriteAll(WiFiClientSecure &c, const uint8_t *data, size_t len);
 
+/* 同上, 但可指定单次 write() 的块大小 (诊断/调参用) */
+bool httpWriteAllChunk(WiFiClientSecure &c, const uint8_t *data, size_t len, size_t chunk);
+
 /* 起一个跳过证书校验的 TLS 连接。
  * 注意 WiFiClientSecure::setTimeout 的单位是【秒】, 且必须在 connect 之前调用
  * 才会写进底层 socket 超时。 */
@@ -45,5 +48,8 @@ std::string httpExtractStringField(const std::string &json, const char *key);
  * 不引 ArduinoJson: 只需要一个字段, 手写反而更省 flash。 */
 std::string httpExtractContent(const std::string &json);
 
-/* 把字符串转义成能安全放进 JSON 字面量的形式 (只处理 " 和 \) */
+/* 把字符串转义成能安全放进 JSON 字面量的形式:
+ *   " \ -> 反斜杠转义;  \n \r \t -> 转义序列;  其余控制字符 -> \u00xx
+ * (原来只处理 " 和 \, 文本里混进换行就会生成非法 JSON —— 文本来源是 ASR 转写和
+ *  模型回答, 平时干净, 但不能指望它永远干净) */
 std::string httpJsonEscape(const char *s);

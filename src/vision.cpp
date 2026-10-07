@@ -65,6 +65,7 @@ static const char *TAG = "vision";    // 日志标签
  * 想再清楚可以上 FRAMESIZE_XGA (1024x768, 编码约 720ms)。 */
 #define SHOT_FRAMESIZE  FRAMESIZE_SVGA
 #define SHOT_QUALITY    0             // 对应 camera_config 的 jpeg_quality: 0-63, 越小越清晰也越大
+                                      // (保持最高画质; 上传提速走"大分块+自动降级", 不再动这里)
 #define SHOT_FB_COUNT   1             // 1 张就够 —— 省下的内存留给 TLS 握手
 
 /* frame2jpg_cb 的 quality 语义和上面相反: 0~100 且越大越好, 换算一下 (12 -> 81) */
@@ -102,17 +103,17 @@ static const char *TAG = "vision";    // 日志标签
  * 库里另有 jpgSetRgb565BE(false) 可切, 但需要手动声明, 这里用不着。 */
 #define SHOT_SWAP_BYTES  0
 
-/* 1 = 编码前把整张图原地转 180°。
+/* 1 = 编码前把整张图原地【上下翻转】。
  *
- * 摄像头输出相对正立是【上下左右全反】的(OV3660 出厂默认寄存器导致,
- * 见 main.cpp 的 CAM_ROT180)。
- * 取景那条路在 buildView() 里靠反向取采样点把它抵消了, 所以屏幕上是正的;
- * 但拍照这条路是 frame2jpg 直接读 fb->buf, 没有那层旋转 ——
- * 结果就是: 屏幕看着正常, 发给模型的却是一张倒置的图, 药盒上的字全是倒的,
- * 模型自然读不出来。这是"识别不准"最根本的一条原因。
+ * ⚠️ 2026-10-06 实测修正 —— 这里原来写的是"原地转 180°", 前提是
+ *    "OV3660 输出上下颠倒 + 左右镜像"。**实测没有左右镜像, 只有上下颠倒。**
+ *    于是 180° 多翻了半圈, 屏幕和照片【双双】变成左右镜像
+ *    (字左右反着、上下正常)。两条路一起错, 所以两边看着一致, 反而不像 bug。
  *
- * 480000 个像素原地转约十几毫秒, 相对 450ms 的编码可以忽略。 */
-#define SHOT_ROT180   1
+ * 现在只翻上下: 行对调, 【列不动】。取景那条路(main.cpp 的 CAM_VFLIP)同步改。
+ *
+ * 480000 个像素原地翻约十几毫秒, 相对 450ms 的编码可以忽略。 */
+#define SHOT_VFLIP    1
 
 /* 拍照前丢几帧, 等 AWB(自动白平衡) / AEC(自动曝光) 收敛。
  *
@@ -139,6 +140,12 @@ static const char *TAG = "vision";    // 日志标签
  * 关掉它, 回答又快又直接, 也省配额。
  * 万一这个模型不认 thinking 参数, API 会回 HTTP 400 —— 那就把这里改成 0。 */
 #define DISABLE_THINKING  1
+
+/* 上传诊断探针: 拍完照后, 把同一张图的 base64 先发一份到 postman-echo.com
+   (先小包证明可达, 再大包), 用来区分「设备发不了大包」和「只对这个接口卡」。
+   排查已完成 (结论: 大 TLS 记录会被对端拒, 64B 小块可用), 关掉它;
+   需要重新扫描时改回 1。 */
+#define SHOT_UPLOAD_PROBE 0
 
 /* max_tokens 要给「思考 + 答案」留够空间。
  * 之前设 64 就是踩了这个坑: 思考过程把那点额度吃光, content 一个字没轮上,
@@ -260,7 +267,11 @@ bool visionInitViewMode()
         return false;
     }
     sensor_t *s = esp_camera_sensor_get();
-    if (s) ESP_LOGI(TAG, "[CAM] PID=0x%04X, 取景 RGB565 QVGA 320x240", s->id.PID);
+    /* 这里打的是**请求**的配置。实际输出尺寸由驱动/传感器再定一档,
+       开机第一条 [CAM] 实际输出 ... 才是真正在用的 —— 两行对不上是正常的,
+       别看到"请求 QVGA"就以为拿到的是 320x240。 */
+    if (s) ESP_LOGI(TAG, "[CAM] PID=0x%04X, 取景请求 RGB565 QVGA(320x240), 实际见下一行",
+                    s->id.PID);
     return true;
 }
 
@@ -298,7 +309,7 @@ VisionResult visionCaptureAndAsk(const char *prompt, VisionStageCb cb)
     VisionResult r = { false, "" };
 
     if (WiFi.status() != WL_CONNECTED) {
-        r.text = "WiFi 没连上 —— 长按 BOOT 3 秒重新配网";
+        r.text = "WiFi 没连上 —— 双击 BOOT 重新配网";
         return r;
     }
 
@@ -351,9 +362,10 @@ VisionResult visionCaptureAndAsk(const char *prompt, VisionStageCb cb)
         }
 #endif
 
-#if SHOT_ROT180
-        /* 原地转 180°: 上下两半对调, 每一行同时左右翻转。
-           只遍历上半部分的行, 每个像素正好被交换一次。 */
+#if SHOT_VFLIP
+        /* 原地上下翻转: 只把上下两半的行对调, 【列不动】。
+           只遍历上半部分的行, 每个像素正好被交换一次。
+           奇数高度时中间那行本来就在正中间, 原地不动。 */
         {
             uint16_t    *px = (uint16_t *)fb->buf;
             const size_t w  = fb->width;
@@ -364,17 +376,8 @@ VisionResult visionCaptureAndAsk(const char *prompt, VisionStageCb cb)
                 uint16_t *rowB = px + (h - 1 - y) * w;
                 for (size_t x = 0; x < w; x++) {
                     const uint16_t t = rowA[x];
-                    rowA[x]           = rowB[w - 1 - x];
-                    rowB[w - 1 - x]   = t;
-                }
-            }
-            /* 奇数高度时中间那行只需自己左右翻 */
-            if (h & 1) {
-                uint16_t *row = px + (h / 2) * w;
-                for (size_t x = 0; x < w / 2; x++) {
-                    const uint16_t t = row[x];
-                    row[x]           = row[w - 1 - x];
-                    row[w - 1 - x]   = t;
+                    rowA[x]           = rowB[x];
+                    rowB[x]           = t;
                 }
             }
         }
@@ -489,6 +492,63 @@ VisionResult visionCaptureAndAsk(const char *prompt, VisionStageCb cb)
     ESP_LOGI(TAG, "[IMG] 原图 %u -> base64 %u 字节",
                   (unsigned)jpgLen, (unsigned)b64Len);
 
+    size_t uploadChunkGuess = 64;   /* 探针扫描出的可用块大小; 缺省 64 (实测最小可用) */
+#if SHOT_UPLOAD_PROBE
+    /* ---- 诊断探针: TLS 记录大小扫描 ----
+       背景: 明文 HTTP 大包完全正常, 但 TLS 记录一大就被对端 RST ——
+       问题在 mbedtls 发出去的大记录上。这里从小到大逐档试整包上传,
+       第一档能整包通过就停, 那就是可行的修复参数。
+       结果只看 [PROBE]/[写] 日志。排查完把 SHOT_UPLOAD_PROBE 改回 0 */
+    {
+        auto probeTls = [&](const uint8_t *payload, size_t plen, const char *tag, size_t chunk) -> bool {
+            WiFiClientSecure pcli;
+            if (!httpConnect(pcli, "postman-echo.com", 443, TLS_TIMEOUT_S)) {
+                ESP_LOGW(TAG, "[PROBE] %s: TLS 连接失败", tag);
+                return false;
+            }
+            const char *kPre = "{\"probe\":\"";
+            const char *kMid = "\",\"junk\":\"";
+            const char *kSuf = "\"}";
+            const size_t pBodyLen = strlen(kPre) + strlen(tag) + strlen(kMid) + plen + strlen(kSuf);
+            pcli.printf("POST /post HTTP/1.1\r\n");
+            pcli.printf("Host: postman-echo.com\r\n");
+            pcli.print("Content-Type: application/json\r\n");
+            pcli.printf("Content-Length: %u\r\n", (unsigned)pBodyLen);
+            pcli.print("Connection: close\r\n\r\n");
+            pcli.print(kPre);
+            pcli.print(tag);
+            pcli.print(kMid);
+            const uint32_t tp = millis();
+            const bool ok = httpWriteAllChunk(pcli, payload, plen, chunk);
+            if (ok) pcli.print(kSuf);
+            ESP_LOGW(TAG, "[PROBE] %s: payload %u 字节 (chunk %u), 写%s, 耗时 %u ms",
+                          tag, (unsigned)plen, (unsigned)chunk, ok ? "完成" : "未完成",
+                          (unsigned)(millis() - tp));
+            if (ok) {
+                bool ch = false;
+                const int code = httpReadHeader(pcli, ch);
+                const std::string body = httpReadBody(pcli, 5000);
+                ESP_LOGW(TAG, "[PROBE] %s: 响应码 %d, 体 %u 字节", tag, code, (unsigned)body.size());
+            }
+            pcli.stop();
+            return ok;
+        };
+        static const uint8_t kSmallProbe[] = "hello-clawd-probe";
+        probeTls(kSmallProbe, sizeof(kSmallProbe) - 1, "small", 4096);
+        /* 从大到小扫描: 找到最大的可用块 (块越大上传越快); 64 是已验证下限 */
+        static const size_t kChunks[] = {1024, 512, 256, 128, 64};
+        for (size_t ci = 0; ci < sizeof(kChunks) / sizeof(kChunks[0]); ci++) {
+            char tg[16];
+            snprintf(tg, sizeof(tg), "scan-%u", (unsigned)kChunks[ci]);
+            if (probeTls(b64, b64Len, tg, kChunks[ci])) {
+                uploadChunkGuess = kChunks[ci];
+                ESP_LOGW(TAG, "[PROBE] 扫描结束: chunk=%u 字节可以整包通过", (unsigned)kChunks[ci]);
+                break;
+            }
+        }
+    }
+#endif
+
     /* ---- 5. 拼请求 ---- */
     const std::string prefix =
         std::string("{\"model\":\"") + ZHIPU_MODEL +
@@ -515,6 +575,7 @@ VisionResult visionCaptureAndAsk(const char *prompt, VisionStageCb cb)
         r.text = "TLS 连接失败 (内存不够或网络不通)";
         return r;
     }
+    ESP_LOGI(TAG, "[API] TLS 已连接, 准备发 %u 字节 body", (unsigned)bodyLen);
 
     client.printf("POST %s HTTP/1.1\r\n", ZHIPU_PATH);
     client.printf("Host: %s\r\n", ZHIPU_HOST);
@@ -526,12 +587,32 @@ VisionResult visionCaptureAndAsk(const char *prompt, VisionStageCb cb)
     /* body 分块写, 不拼成一整个大 String —— 那样要再拷一份 100+KB。
        writeAll() 里面会循环, 单次 write() 发不完一个 TLS 记录之外的部分 */
     client.print(prefix.c_str());
-    const bool bodySent = httpWriteAll(client, b64, b64Len);
+    const uint32_t tBody = millis();
+    const bool bodySent = httpWriteAllChunk(client, b64, b64Len, uploadChunkGuess);
+    ESP_LOGI(TAG, "[API] 正文写%s, 耗时 %u ms",
+                  bodySent ? "完成" : "未完成", (unsigned)(millis() - tBody));
     if (bodySent) client.print(suffix.c_str());
     heap_caps_free(b64);
 
     if (!bodySent) {
         ESP_LOGI(TAG, "[API] 图片没能发完");
+        /* 诊断: 卡住时对端很可能早就回了响应(比如 4xx), 只是没人读过。
+           把连接里已经到的字节捞出来看一眼, 再断开 */
+        std::string early;
+        const uint32_t tR = millis();
+        while (millis() - tR < 1500 && early.size() < 600) {
+            while (client.available() && early.size() < 600)
+                early += (char)client.read();
+            if (!client.connected() && !client.available()) break;
+            delay(5);
+        }
+        ESP_LOGI(TAG, "[API] 断开前读到对端 %u 字节 (connected=%d): %s",
+                      (unsigned)early.size(), (int)client.connected(), early.c_str());
+        /* 诊断: mbedtls 自己的错误串 —— 能区分是 socket 超时/连接重置/内存不够 */
+        char errBuf[160] = {0};
+        const int errRes = client.lastError(errBuf, sizeof(errBuf));
+        ESP_LOGW(TAG, "[API] mbedtls lastError(%d): %s | RSSI=%d, WiFi.status=%d",
+                      errRes, errBuf, (int)WiFi.RSSI(), (int)WiFi.status());
         client.stop();
         r.text = "上传中断 (图片没发完)";
         return r;

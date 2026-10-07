@@ -48,6 +48,30 @@ static std::string htmlEsc(const std::string &in)
     return out;
 }
 
+/* 药名要放进 URL 的 query 里。中文原样放一般也能用, 但 '&' '#' '+' '%' 和空格
+   会把链接拆坏(比如药名里有个 & 就会把参数切断)—— 这几类必须百分号编码。
+   中文一起编码掉最省心, 服务端 arg() 会自动解回来。 */
+static std::string urlEnc(const std::string &in)
+{
+    static const char *hex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); i++) {
+        const unsigned char c = (unsigned char)in[i];
+        const bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                          (c >= '0' && c <= '9') ||
+                          c == '-' || c == '_' || c == '.' || c == '~';
+        if (safe) {
+            out += (char)c;
+        } else {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 0x0F];
+        }
+    }
+    return out;
+}
+
 /* ==================== 主页: 说话 + 列表 + 添加 ==================== */
 static void handleRoot()
 {
@@ -79,7 +103,8 @@ static void handleRoot()
     } else {
         page += "<table><tr><th>药品</th><th>方案</th><th>上次服用</th><th></th></tr>";
         for (int i = 0; i < n; i++) {
-            const std::string nm = htmlEsc(std::string(items[i].name));
+            const std::string nm    = htmlEsc(std::string(items[i].name));   // 显示用
+            const std::string nmUrl = urlEnc(std::string(items[i].name));    // 放进链接用
             page += "<tr><td><b>" + nm + "</b></td><td>";
             if (items[i].perDay) {
                 page += "一天 " + std::to_string((unsigned)items[i].perDay) + " 次";
@@ -96,8 +121,8 @@ static void handleRoot()
 
             /* 确认弹窗里刻意不写药名 —— 药名里若含引号会把 JS 字符串截断 */
             page += "</td><td class='act'>"
-                    "<a href='/taken?n=" + nm + "'>吃了</a>"
-                    "<a class='d' href='/del?n=" + nm +
+                    "<a href='/taken?n=" + nmUrl + "'>吃了</a>"
+                    "<a class='d' href='/del?n=" + nmUrl +
                     "' onclick=\"return confirm('确定删掉这条用药记录?')\">删除</a>"
                     "</td></tr>";
         }
@@ -124,6 +149,10 @@ static void handleRoot()
                     "<span class='hint'>（模型认药名用的就是它）</span></p>";
         }
     }
+    /* 救屏入口 —— 面板被杜邦线抖白之后自己回不来, 这里是第二条命 */
+    page += "<p class='act'><a href='/tftreset'>屏幕全白? 点这里重置屏幕</a>"
+            "<span class='hint'>（重跑一次初始化, 黑屏约 1 秒）</span></p>";
+
     page += "</body></html>";
 
     s_server->send(200, "text/html; charset=utf-8", page.c_str());
@@ -176,7 +205,8 @@ static void handleAdd()
     std::string slots = toStd(s_server->arg("s"));
     strTrim(slots);
 
-    const bool ok = medAdd(nm.c_str(), (uint8_t)pd, slots.c_str());
+    /* 时段留空 = 保持原样, 不是"清空" —— 改次数时不必重填时段 */
+    const bool ok = medAdd(nm.c_str(), (uint8_t)pd, slots.empty() ? nullptr : slots.c_str());
     ESP_LOGI(TAG, "[MED] %s 方案: 一天 %d 次 %s -> %s",
                   nm.c_str(), pd, slots.c_str(), ok ? "已保存" : "保存失败");
 
@@ -189,9 +219,25 @@ static void handleTaken()
 {
     const std::string nm = toStd(s_server->arg("n"));
     const bool ok = medMarkTaken(nm.c_str());
+    /* 失败有两种原因, 别都归成"没有这条记录" —— medMarkTaken 在设备时间
+       没同步时会**拒绝写入**(照记会把上次的有效时间戳冲成 0, 之后间隔全算错) */
     ESP_LOGI(TAG, "[MED] 标记服用: %s -> %s (时间 %s)",
-                  nm.c_str(), ok ? "已记录" : "没有这条记录",
+                  nm.c_str(),
+                  ok ? "已记录" : (medTimeReady() ? "没有这条记录" : "没记: 时间未同步"),
                   medTimeReady() ? medFmtTime(medNow()).c_str() : "未同步");
+
+    if (!ok) {
+        /* 失败得在**页面上**说清楚: 只打串口的话, 手机上点一下就像"没反应",
+           用户会以为记上了 */
+        std::string page = PAGE_HEAD;
+        page += "<h3>没记上</h3><p>";
+        page += medTimeReady()
+              ? "记录里没有「" + htmlEsc(nm) + "」这条药。"
+              : "设备时间还没同步(没连上 WiFi?), 记下来会算不准间隔, 所以先没记。";
+        page += "</p><p><a href='/'>← 返回用药记录</a></p></body></html>";
+        s_server->send(200, "text/html; charset=utf-8", page.c_str());
+        return;
+    }
 
     s_server->sendHeader("Location", "/", true);
     s_server->send(303, "text/plain", "");
@@ -208,11 +254,31 @@ static void handleDel()
     s_server->send(303, "text/plain", "");
 }
 
+/* ==================== 重置屏幕 (救屏) ====================
+ * 手指碰一下杜邦线, 面板就可能把 CASET(0x2A)/RAMWR(0x2C) 抖成 DISPOFF(0x28) ——
+ * 一位之差。屏幕白掉之后它自己是回不来的(全工程只有初始化表里那一条 DISPON),
+ * 这个按钮就是给它第二条命, 省得跑到设备跟前拔电。
+ *
+ * ⚠️ 先 send() 再重初始化: 那边有 0.77 秒固定延时(SWRESET/SLPOUT/DISPON),
+ *    不该让浏览器干等 —— 响应先写出去, lwIP 在 core 0, delay() 期间照样发得完。 */
+static void (*s_onTftReset)() = nullptr;
+
+static void handleTftReset()
+{
+    s_server->send(200, "text/html; charset=utf-8",
+                   "<meta charset=utf-8>"
+                   "<meta name=viewport content='width=device-width,initial-scale=1'>"
+                   "<p>屏幕已重新初始化, 黑屏约 1 秒后自动恢复。</p>"
+                   "<p><a href='/'>← 返回用药记录</a></p>");
+    if (s_onTftReset) s_onTftReset();
+}
+
 /* ==================== 生命周期 ==================== */
-void webuiBegin()
+void webuiBegin(void (*onTftReset)())
 {
     static WebServer server(80);        // 静态: 得活得比这个函数长
     s_server = &server;
+    s_onTftReset = onTftReset;
 
     server.on("/",      HTTP_GET,  handleRoot);
     server.on("/add",   HTTP_POST, handleAdd);
@@ -220,6 +286,7 @@ void webuiBegin()
     server.on("/del",   HTTP_GET,  handleDel);
     server.on("/say",   HTTP_POST, handleSay);
     server.on("/clear", HTTP_GET,  handleClear);
+    server.on("/tftreset", HTTP_GET, handleTftReset);
 
     /* 最近一次拍的照片。正常模式下**不能**像 TEST 模式那样临时开
        另一个 80 端口服务器(两个 WebServer 抢同一端口会静默 bind 失败),

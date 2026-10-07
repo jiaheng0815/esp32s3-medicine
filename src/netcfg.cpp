@@ -10,10 +10,21 @@ static const char *TAG = "netcfg";    // 日志标签
 #include <DNSServer.h>
 #include <Preferences.h>
 
+/* WIFI_HARDCODE_SSID / WIFI_HARDCODE_PASS 在这里定义。
+   放 secrets.h 而不是本文件, 是因为**本文件受 git 跟踪** ——
+   密码写进来会随版本库泄出去; secrets.h 被 .gitignore 忽略。 */
+#include "secrets.h"
+
 /* ==================== 可改参数 ==================== */
 #define AP_SSID        "ESP32-CAM-Setup"   // 配网热点的名字
 #define AP_PASS        nullptr             // 想给热点加密就填 >=8 位的字符串
 #define SETUP_TIMEOUT  300000              // 配网多久没人操作就自动重启 (ms)
+
+/* ---------- 临时硬编码 WiFi (排障用) ----------
+ * 开关是 secrets.h 里的 WIFI_HARDCODE_SSID / WIFI_HARDCODE_PASS:
+ * 非空就只用它们连(**完全不读 NVS**), 留空则走正常流程。
+ * 配网页面很麻烦、或想排除"凭据存错了"这类怀疑时用。
+ * ⚠️ 用完记得清空 —— 只要填着, 配网页面存的凭据就会被一直忽略。 */
 /* ================================================= */
 
 static Preferences prefs;
@@ -29,17 +40,33 @@ bool wifiHasStored()
 
 bool wifiConnectStored(uint32_t timeoutMs)
 {
-    prefs.begin("wifi", true);
-    const std::string ssid = toStd(prefs.getString("ssid", ""));   // NVS 返回 Arduino String
-    const std::string pass = toStd(prefs.getString("pass", ""));
-    prefs.end();
+    std::string ssid, pass;
 
-    if (ssid.empty()) return false;
+    if (WIFI_HARDCODE_SSID[0]) {
+        /* 临时硬编码: 绕过 NVS (见文件上方的开关注释)。
+           WIFI_HARDCODE_SSID 是字面量, 这个分支在编译期就是常量, 会被折掉。 */
+        ssid = WIFI_HARDCODE_SSID;
+        pass = WIFI_HARDCODE_PASS;
+        ESP_LOGI(TAG, "[WIFI] 用硬编码凭据 \"%s\" (忽略 NVS)", ssid.c_str());
+    } else {
+        prefs.begin("wifi", true);
+        ssid = toStd(prefs.getString("ssid", ""));   // NVS 返回 Arduino String
+        pass = toStd(prefs.getString("pass", ""));
+        prefs.end();
+
+        if (ssid.empty()) return false;
+    }
 
     /* persistent(false): 不让 SDK 把凭据再往它自己的 NVS 区存一份,
        免得改了配网页面的密码后还有一份旧的在暗处生效 */
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
+    /* setSleep(false): 关掉 WiFi 省电(modem sleep)。
+       省电模式与持续 TX 的兼容性是 ESP32 的老问题(摄像头 + WiFi 同跑时尤甚):
+       实测症状是大 body 上传推出第一个 TLS 记录(4KB)后整条连接失联 ——
+       收不到任何 ACK、15 秒后被协议栈掐断, 而小请求(TTS)完全不受影响。
+       先关掉它验证。代价: 功耗略升, 本设备常供电, 无所谓。 */
+    WiFi.setSleep(false);
     WiFi.setAutoReconnect(true);
     WiFi.begin(ssid.c_str(), pass.c_str());
 

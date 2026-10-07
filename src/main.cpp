@@ -128,10 +128,15 @@ static const char *TAG = "main";    // ESP-IDF 日志标签
 
 #define INIT_SPI_SPEED_HZ   8000000    // 初始化阶段(抗干扰)
 /* 刷图阶段。QQVGA 一帧 38400 字节:
- *   15MHz -> 20.5ms   40MHz -> 7.7ms
- * 这一项直接吃掉帧周期(17.77FPS = 56.3ms)的一大截, 提到 40MHz 才能到 15FPS+。
- * 花屏/雪花/撕裂说明排线扛不住, 逐级降到 27000000 或 20000000。 */
-#define SPI_SPEED_HZ        80000000
+ *   15MHz -> 20.5ms   27MHz -> 11.4ms   40MHz -> 7.7ms   80MHz -> 3.8ms
+ *
+ * ⚠️ 2026-10-07: 从 80MHz 降到 27MHz。**这不是为了性能, 是为了不白屏。**
+ * 杜邦线没做阻抗匹配, 80MHz(位周期 12.5ns)已经踩在它的谐振点附近 ——
+ * 手或线稍微动一下, 寄生电容/回路面积一变, 边沿振铃就能让面板多采或少采一个时钟,
+ * 字节从这一位开始全错。ST7735S 手册的写时序上限才 15MHz。
+ * 降到 27MHz 的代价只有约 2FPS(17.7 -> ~15.6, 帧周期的大头是摄像头和缩放, 不是这一项),
+ * 换来 3 倍的时序余量。还白屏就再降到 20000000。 */
+#define SPI_SPEED_HZ        27000000
 
 #define PANEL_SELFTEST      1    // 开机闪 红/绿/蓝/白 自检
 
@@ -148,19 +153,25 @@ static const char *TAG = "main";    // ESP-IDF 日志标签
 
 /* -------- OV3660 画面方向 (镜头反转) --------
  * OV3660 出厂默认寄存器 0x3820=0x40 / 0x3821=0x00, 非 JPEG 格式下输出的是
- * 「上下颠倒 + 左右镜像」, 相对正立画面正好转了 180°, 这不是接线问题。
+ * 「上下颠倒」—— ⚠️ 2026-10-06 实测: **只有上下颠倒, 没有左右镜像**。
+ * (老注释写的是"上下颠倒 + 左右镜像 = 180°", 那个前提是错的, 见下。)
+ * 这是出厂寄存器, 不是接线问题。
  *
- * 修它就用下面的 CAM_ROT180。
+ * 修它就用下面的 CAM_VFLIP。
  *
  * 别改用传感器端翻转 (set_hmirror/set_vflip): 驱动底层走 set_image_options(),
  * 它会连带重写 0x4514 / 0x4520 / X_INCREMENT / Y_INCREMENT。在 OV3660 + QVGA +
  * RGB565 下实测会把画面搞成斜切(平行四边形) + 颜色错乱。
  */
 
-/* 1 = 把画面转 180° (抵消 OV3660 的出厂反向)。
- * 在 buildView() 降采样时反向取采样点实现: 不碰传感器、不影响屏幕 UI 文字方向、
- * 也不增加耗时 —— 只是换个索引顺序, 取的还是同一批 2x2 像素块。 */
-#define CAM_ROT180      1
+/* 1 = 把画面上下翻转 (抵消 OV3660 的出厂颠倒)。
+ * 在 buildView() 取采样点时把行号倒过来实现: 不碰传感器、不影响屏幕 UI 文字方向、
+ * 也不增加耗时 —— 只是换个索引顺序, 取的还是同一批 2x2 像素块。
+ *
+ * ⚠️ 为什么不是"转 180°": 多转那半圈会让**左右也反**, 画面变成镜像
+ *    (字左右反着、上下正常)。因为拍照路径(vision.cpp 的 SHOT_VFLIP)同样是错的,
+ *    两条路一起镜像, 屏幕上看着"自洽", 非常难发现。 */
+#define CAM_VFLIP       1
 
 #define VIEW_W          160
 #define VIEW_H          120
@@ -235,6 +246,10 @@ static void displayInit()
                   tft.width(), tft.height(),
                   TFT_SCLK_PIN, TFT_MOSI_PIN, TFT_CS_PIN,
                   TFT_DC_PIN, TFT_RST_PIN, TFT_BL_PIN);
+    /* 这一行是「烧进去的到底是哪版固件」的判据 —— 碰线白屏那套修复(降速 +
+       每帧补 DISPON)不留这一行的话, 串口上看不出新旧, 只能靠猜。 */
+    ESP_LOGI(TAG, "[TFT] SPI=%u Hz, 每帧补 DISPON (碰线白屏防护)",
+                  (unsigned)SPI_SPEED_HZ);
 }
 
 /* ==================== 测试模式 (IS_TEST=1) ====================
@@ -500,7 +515,7 @@ static void buildView(const camera_fb_t *fb)
        n==1 时那些运算纯属白做, 每个像素其实只是搬两个字节再换个序。 */
     if (sw == VIEW_W && sh == VIEW_H) {
         for (int y = 0; y < VIEW_H; y++) {
-#if CAM_ROT180
+#if CAM_VFLIP
             const int sy = VIEW_H - 1 - y;
 #else
             const int sy = y;
@@ -508,11 +523,7 @@ static void buildView(const camera_fb_t *fb)
             const uint8_t *src = fb->buf + (size_t)sy * sw * 2;
             uint16_t      *dst = viewBuf + (size_t)y * VIEW_W;
             for (int x = 0; x < VIEW_W; x++) {
-#if CAM_ROT180
-                const int sx = VIEW_W - 1 - x;
-#else
-                const int sx = x;
-#endif
+                const int sx = x;            // 列不动 —— 只上下翻, 不左右翻
                 const uint8_t *p = src + (size_t)sx * 2;
 #if CAM_MSB_FIRST
                 dst[x] = (uint16_t)((p[0] << 8) | p[1]);
@@ -530,20 +541,16 @@ static void buildView(const camera_fb_t *fb)
     const int n  = xr * yr;
 
     for (int y = 0; y < VIEW_H; y++) {
-        /* CAM_ROT180: 行和列都倒着取, 出来的就是转 180° 的画面。
+        /* CAM_VFLIP: 行倒着取(上下翻), 列【照常】取。
            取的是同一批 2x2 块, 只是块的先后顺序反了, 均值不受影响 */
-#if CAM_ROT180
+#if CAM_VFLIP
         const int sy = (VIEW_H - 1 - y) * yr;
 #else
         const int sy = y * yr;
 #endif
         uint16_t *dst = viewBuf + (size_t)y * VIEW_W;
         for (int x = 0; x < VIEW_W; x++) {
-#if CAM_ROT180
-            const int sx = (VIEW_W - 1 - x) * xr;
-#else
-            const int sx = x * xr;
-#endif
+            const int sx = x * xr;       // 列不动 —— 只上下翻, 不左右翻
             uint32_t r = 0, g = 0, b = 0;
             for (int j = 0; j < yr; j++) {
                 for (int i = 0; i < xr; i++) {
@@ -565,6 +572,27 @@ static void buildView(const camera_fb_t *fb)
 static void pushView()
 {
     tft.startWrite();
+
+    /* ⚠️ 这一条 DISPON 是「碰线白屏」的解药, 别删。
+     *
+     * 症状: 手指轻碰杜邦线(线根本没断开) -> 屏幕全白, 不动它就一直白, 重启才恢复。
+     *
+     * 原因: 当初用 80MHz 走杜邦线(位周期只有 12.5ns), 手/线一动寄生电容就变, 边沿振铃
+     *   多穿越一次阈值 = 面板多采一个时钟 = 某一位翻掉。而 setAddrWindow() 连发的
+     *   三条命令里**有两条与 DISPOFF 只差一位**:
+     *       CASET(0x2A) ^ 0x02 = 0x28 (DISPOFF)
+     *       RAMWR(0x2C) ^ 0x04 = 0x28 (DISPOFF)
+     *   三条命令每帧都发, 撞上的概率一点都不小。面板收到 0x28 就把显示关掉,
+     *   而全工程除了 initR() 的初始化表, 再没有第二条 DISPON —— 于是白到重启。
+     *
+     * 修法: 每帧开头补一条 DISPON。它是幂等的(显示已经开着时收到等于没收到),
+     *   所以"碰一下"的后果从**永久白屏**降级成**最多闪一帧(约 56ms)**, 肉眼基本看不见。
+     *   反过来: 要屏幕保持黑, 得每一帧的 DISPON 都被打飞, 那是不可能的。
+     *
+     * 开销 1 字节 / 38400 字节。⚠️ 前提是 DISPON 在已点亮时确实是 no-op ——
+     * 上机时盯一下有没有闪; 真闪的话就改成每 N 帧发一次。 */
+    tft.writeCommand(ST77XX_DISPON);
+
     tft.setAddrWindow(0, VIEW_Y, VIEW_W, VIEW_H);
     tft.writePixels(viewBuf, VIEW_W * VIEW_H);
     tft.endWrite();
@@ -748,6 +776,58 @@ static const char ASK_PROMPT[] =
     "如果包装上的药名看不清或不确定，只回答三个字：看不清。";
 #endif
 
+/* 模型答的不是药名时(「看不清」「无法确定」...)别往 medAdvice 里送。
+ * 那条路会回一句「看不清: 还没录入用药方案」—— 把"没认出来"说成"没录入",
+ * 用户照着去录入一条名叫"看不清"的药就更糟了。 */
+static bool looksLikeNotADrug(const std::string &t)
+{
+    static const char *kNo[] = { "看不清", "不清楚", "不确定", "无法", "模糊", "不是药" };
+    for (size_t i = 0; i < sizeof(kNo) / sizeof(kNo[0]); i++) {
+        if (t.find(kNo[i]) != std::string::npos) return true;
+    }
+    return false;
+}
+
+/* 把模型答的整句收拾成药名: 「这是阿莫西林胶囊。」->「阿莫西林胶囊」
+ * 名字要进 NVS 表、还要当 ASR 热词用, 带着标点和客套话没好处。
+ * 只做两件事: 掐掉句末标点, 剥掉模型爱加的前缀。 */
+static std::string cleanDrugName(const std::string &raw)
+{
+    std::string s = raw;
+
+    /* 掐句末标点和空白。全角标点是 3 字节, 按字节比尾部就行 */
+    static const char *kTail[] = { "。", "，", "、", "；", "：", "！", "？",
+                                   ".", ",", ";", ":", "!", "?" };
+    for (bool again = true; again && !s.empty(); ) {
+        again = false;
+        while (!s.empty() && (s.back() == ' ' || s.back() == '\t' ||
+                              s.back() == '\r' || s.back() == '\n')) {
+            s.pop_back();
+            again = true;
+        }
+        for (size_t i = 0; i < sizeof(kTail) / sizeof(kTail[0]); i++) {
+            const std::string t = kTail[i];
+            if (s.size() >= t.size() &&
+                s.compare(s.size() - t.size(), t.size(), t) == 0) {
+                s.erase(s.size() - t.size());
+                again = true;
+                break;
+            }
+        }
+    }
+
+    /* 剥前缀。⚠️ 按字节长度比, 前缀都在开头且是完整的 UTF-8 序列, 不会切坏字符 */
+    static const char *kHead[] = { "这是", "这个药是", "这药是", "答：", "答:" };
+    for (size_t i = 0; i < sizeof(kHead) / sizeof(kHead[0]); i++) {
+        const std::string h = kHead[i];
+        if (s.size() > h.size() && s.compare(0, h.size(), h) == 0) {
+            s.erase(0, h.size());
+            break;
+        }
+    }
+    return s;
+}
+
 static void runCaptureAsk()
 {
 #if IS_TEST
@@ -765,7 +845,22 @@ static void runCaptureAsk()
 
 #if !IS_TEST
         /* 第二阶段: 本地查记忆、本地算时间 —— 纯本地, 不调 API */
-        const std::string advice = medAdvice(r.text.c_str());
+
+        /* 认出来了就顺手把药名记进药品表(perDay=0 = 只有名字, 方案等用户说)。
+           ⚠️ 这一步是**语音那条路的前提**: 药名匹配和 ASR 热词表都只认表里的名字,
+           而拍照是唯一能把药名自动"采"进表里的入口 —— 表空着的时候,
+           语音说「XX 一天两次」只会得到一句「还没记录任何药」。
+           ⚠️ 只在**不存在**时新增: medAdd 对已存在的药是"更新方案",
+           直接调会把用户已经说好的「一天两次」冲成 0。 */
+        const std::string drugName = looksLikeNotADrug(r.text) ? std::string()
+                                                                : cleanDrugName(r.text);
+        if (!drugName.empty() && medFind(drugName.c_str()) < 0) {
+            medAdd(drugName.c_str(), 0, nullptr);
+        }
+
+        const std::string advice = drugName.empty()
+            ? std::string("没认出来是什么药, 换个角度或离近点再拍一张。")
+            : medAdvice(drugName.c_str());
         ESP_LOGI(TAG, "\n========== 用药提醒 ==========");
         ESP_LOGI(TAG, "%s", advice.c_str());
         ESP_LOGI(TAG, "==============================");
@@ -901,6 +996,27 @@ static void handleBootButton()
     }
 }
 
+/* ==================== 屏幕重初始化 (网页「救屏」按钮) ====================
+ * 碰线把面板搞白之后的第二条命: 手机点一下, 不用跑到设备跟前重启。
+ *
+ * 重入 displayInit() 是安全的 —— initR() 内部先脉冲一次 RST、再重发整套 init,
+ * 面板不管是收到假的 DISPOFF、还是被抖成软件复位, 都会回到已知状态。
+ *
+ * 代价: initR() 里的固定延时(SWRESET 150ms + SLPOUT 500ms + DISPON 100ms),
+ * 约 0.77 秒黑屏。之后**不用手工重画** —— 取景循环下一帧(约 56ms)就把画面补上了。
+ *
+ * ⚠️ 必须拿 tftLock(): 语音 task 可能正在画电平条, 而 Adafruit_SPITFT 并发调用
+ *    会把内部状态搞乱(见上面互斥锁那一段)。 */
+#if !IS_TEST     /* 只有正常模式有常驻网页, TEST 模式下它就是没人用的 static -> 警告 */
+static void tftReinit()
+{
+    if (!tftLock()) return;
+    s_lastLevel = -1;               // 电平条被清掉了, 下一帧强制重画
+    displayInit();
+    tftUnlock();
+}
+#endif
+
 /* ====================== setup / loop ====================== */
 void setup()
 {
@@ -932,6 +1048,9 @@ void setup()
     /* TFT 互斥锁在这里就建好, 别指望 tftLock() 里的懒初始化:
        语音 task 和主循环可能同时第一次调用, 各自建一个 mutex = 等于没锁 */
     s_tftMux = xSemaphoreCreateMutex();
+
+    /* 药品记忆那把锁同理(语音 task 和网页/拍照路径都读写同一块静态缓冲) */
+    medBegin();
 
     displayInit();
     bootSelfTest();
@@ -989,7 +1108,7 @@ void setup()
 
     /* ---- 用药记录网页 ----
        麦克风没接/坏了时这是降级录入途径 —— 语音走的是同一条处理链路 */
-    webuiBegin();
+    webuiBegin(tftReinit);          // 网页上的「重置屏幕」按钮走 tftReinit
 
 #if TTS_TEST
     /* ---- 喇叭测试 ----
