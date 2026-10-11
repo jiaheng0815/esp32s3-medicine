@@ -101,6 +101,25 @@ static const char *TAG = "vision";    // 日志标签
  * 480000 个像素原地翻约十几毫秒, 相对 450ms 的编码可以忽略。 */
 #define SHOT_VFLIP    1
 
+/* 1 = 编码前再把整张图原地【转 180°】(在 SHOT_VFLIP 的基础上)。
+ *
+ * 2026-10-11 加。和 SHOT_VFLIP 是**两码事**, 别混:
+ *   SHOT_VFLIP  修的是**传感器出厂方向**(OV3660 非 JPEG 输出上下颠倒, 见上面)
+ *   SHOT_ROT180 修的是**安装方向** —— 现场设备倒装, 就是"由于位置原因只能
+ *               这样拍摄"造成的; 传感器再怎么修, 机器倒着, 出来的图就是倒的
+ *
+ * 为什么值得加: 药盒文字倒置会显著拉低认字率。同一张实拍图 PC 对照实验:
+ *   倒着发 -> 3 次全错(「盐酸氯环利嗪片」读成「盐酸氟环利嗪片」)
+ *   转正发 -> 3 次全对
+ *
+ * ⚠️ 取景(屏幕)特意**不做**同样的旋转, 和上面「两条路一致」的教训不冲突:
+ *   取景是给人看的, 机器倒装时画面跟着倒才是"所见即所得"(屏幕上的提示文字
+ *   是独立画的, 跟着转反而乱); 照片是给模型读字的, 转正只对它有好处。
+ *   两个消费者目的不同, 各自取最优。
+ *
+ * 机器正装(位置恢复正常)之后改回 0。 */
+#define SHOT_ROT180   1
+
 /* 拍照前丢几帧, 等 AWB(自动白平衡) / AEC(自动曝光) 收敛。
  *
  * 传感器是拍照前才 init 的, 增益从零开始调整; 这时候立刻拍会拿到"未校正"
@@ -364,6 +383,36 @@ VisionResult visionCaptureAndAsk(const char *prompt, VisionStageCb cb)
                     const uint16_t t = rowA[x];
                     rowA[x]           = rowB[x];
                     rowB[x]           = t;
+                }
+            }
+        }
+#endif
+
+#if SHOT_ROT180
+        /* 原地转 180° = 行对调 + 每行内左右反转。自包含(不依赖上面 VFLIP 的值):
+           两个开关都是"再叠一层"的语义 —— 现场是 VFLIP=1 且机器倒装, 两个都开。
+           48 万像素两趟遍历约几十毫秒, 相对 450ms 的编码可以忽略。 */
+        {
+            uint16_t    *px = (uint16_t *)fb->buf;
+            const size_t w  = fb->width;
+            const size_t h  = fb->height;
+
+            for (size_t y = 0; y < h / 2; y++) {          // ① 行对调(上下翻)
+                uint16_t *rowA = px + y * w;
+                uint16_t *rowB = px + (h - 1 - y) * w;
+                for (size_t x = 0; x < w; x++) {
+                    const uint16_t t = rowA[x];
+                    rowA[x]           = rowB[x];
+                    rowB[x]           = t;
+                }
+            }
+
+            for (size_t y = 0; y < h; y++) {              // ② 每行内左右反转
+                uint16_t *row = px + y * w;
+                for (size_t x = 0; x < w / 2; x++) {
+                    const uint16_t t = row[x];
+                    row[x]             = row[w - 1 - x];
+                    row[w - 1 - x]     = t;
                 }
             }
         }

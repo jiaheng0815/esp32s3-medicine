@@ -480,7 +480,7 @@ static bool playWavBuffer(const uint8_t *wav, size_t len, bool interruptible)
             done += m;
 
             /* 播报中途按一下 BOOT 就能打断 —— 4~8 秒听着不能停会让人烦 */
-            if (interruptible && gpio_get_level((gpio_num_t)BUTTON_PIN) == 0) {
+            if (interruptible && buttonDown()) {
                 ESP_LOGI(TAG, "[VOICE] 用户按键, 打断播报");
                 break;
             }
@@ -931,7 +931,7 @@ static void recordAndHandle()
 
         /* 松手就停 —— 这就是必须有独立 task 的原因:
            主循环的按键检测只有 ~15Hz, 而且拍照/上传期间干脆不跑 */
-        if (gpio_get_level((gpio_num_t)BUTTON_PIN) != 0) break;
+        if (!buttonDown()) break;
     }
 
     i2sUninstall();
@@ -1161,14 +1161,14 @@ void voiceSelfTest()
     ESP_LOGI(TAG, "");
 
     for (;;) {
-        while (gpio_get_level((gpio_num_t)BUTTON_PIN) != 0) delay(20);   // 等按下
+        while (!buttonDown()) delay(20);                   // 等按下
         delay(30);                                                          // 消抖
 
         ESP_LOGI(TAG, "[自检] 录音中... 松手结束");
         ampOn(false);                       // 录音期间关功放(自激)
         if (!i2sInstallRx()) {
             ESP_LOGI(TAG, "[自检] !! I2S 录音模式安装失败");
-            while (gpio_get_level((gpio_num_t)BUTTON_PIN) == 0) delay(20);
+            while (buttonDown()) delay(20);
             continue;
         }
 
@@ -1189,12 +1189,12 @@ void voiceSelfTest()
                 updateStats(s_recBuf + VOICE_PCM_OFF + s_recPcmLen, got, rms);
                 s_recPcmLen += got;
             }
-            if (gpio_get_level((gpio_num_t)BUTTON_PIN) != 0) break;
+            if (!buttonDown()) break;
         }
         i2sUninstall();
 
         /* 等松手 —— 否则回放期间还按着的手会被当成下一次录音 */
-        while (gpio_get_level((gpio_num_t)BUTTON_PIN) == 0) delay(20);
+        while (buttonDown()) delay(20);
 
         ESP_LOGI(TAG, "[自检] 录到 %u 字节 (%.1f 秒), 峰值 %u, 范围 [%d, %d], 非零 %u/%u",
                       (unsigned)s_recPcmLen,

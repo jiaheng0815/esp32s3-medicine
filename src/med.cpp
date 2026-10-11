@@ -18,9 +18,24 @@ static const char *TAG = "med";    // 日志标签
    不是滚动的 24 小时 —— 见 med.h 里 MedItem 那段说明。 */
 #define MED_WINDOW_SEC  (24UL * 60 * 60)
 
+/* 拍照后「这味药等你录方案」的机会保留多久(见 medSetPendingDrug)。
+   用 millis() 而不是 medNow(): 这是"刚拍完这几分钟"的相对时间, 和设备
+   有没有对上 NTP 无关; 比较用无符号差值, millis 回绕也不会算错。 */
+#define MED_PENDING_TTL_MS  (5UL * 60 * 1000)
+
 /* 整张表在这个静态缓冲里读写过一次。放静态区而不是栈上 ——
    3900 字节的栈数组会直接把 loopTask 的栈顶穿 */
 static char s_blob[MED_BLOB_MAX];
+
+/* ==================== 刚拍到的药 ====================
+ * 拍照识别成功后由 medSetPendingDrug() 记下药名, 等用户用一句
+ * 「一天两次」补全方案(为什么需要, 见 med.h)。
+ *
+ * ⚠️ 和 s_blob 一样是**多 task 共享**的: loopTask 拍照时写, voiceTask
+ *    (优先级 3) 和 webui 说话时读 —— 所以只在持有 MedGuard 时访问。 */
+static char     s_pendingName[MED_NAME_LEN];
+static uint32_t s_pendingAtMs;      // 记下的时刻 (millis)
+static bool     s_pending;          // false = 没有待补全的药
 
 /* ==================== 互斥锁 ====================
  * s_blob 是**所有函数共用**的一块静态缓冲: medLoad 从它解析, saveItems 往里拼。
@@ -174,6 +189,30 @@ static bool nameMatch(const char *a, const char *b)
     return a && b && *a && *b && (strstr(a, b) || strstr(b, a));
 }
 
+/* ---- 刚拍到的药: 三个只在 MedGuard 保护下调的小工具 ---- */
+
+/* 机会还在有效期内吗。无符号差值, millis 回绕(约 49.7 天)也不会算错 */
+static bool pendingFresh()
+{
+    return s_pending && (uint32_t)(millis() - s_pendingAtMs) < MED_PENDING_TTL_MS;
+}
+
+/* 刚拍的那味药在 items 里的下标; 没有/过期/已被删掉都返回 -1 */
+static int findPending(const MedItem *items, int n)
+{
+    if (!pendingFresh()) return -1;
+    for (int i = 0; i < n; i++) {
+        if (nameMatch(items[i].name, s_pendingName)) return i;
+    }
+    return -1;
+}
+
+static void pendingClear()
+{
+    s_pending        = false;
+    s_pendingName[0] = '\0';
+}
+
 /* ==================== 常见药名(内置表) ==================== */
 static const char *const kCommonDrugs[] = {
     "阿莫西林", "头孢", "阿奇霉素", "左氧氟沙星", "布洛芬", "对乙酰氨基酚",
@@ -283,6 +322,23 @@ bool medAdd(const char *name, uint8_t perDay, const char *slots)
 
     ESP_LOGI(TAG, "[MED] 新增: %s (一天 %u 次)", items[n].name, (unsigned)perDay);
     return saveItems(items, n + 1);
+}
+
+/* 记住刚拍照认出来的药 —— 见 med.h 的说明(含"调用前确认药在表里")。 */
+void medSetPendingDrug(const char *name)
+{
+    MedGuard g;
+    if (!name || !*name) return;            // 传空名 = 不改变现状(拍糊时保留旧机会)
+
+    char clean[MED_NAME_LEN * 2];           // 先粗筛, 后面 utf8SafeCopy 再按字符边界截
+    sanitizeName(clean, sizeof(clean), name);
+    if (!clean[0]) return;
+
+    utf8SafeCopy(s_pendingName, sizeof(s_pendingName), clean);
+    s_pendingAtMs = millis();
+    s_pending     = true;
+    ESP_LOGI(TAG, "[MED] 记住刚拍的药: %s (5 分钟内说「一天两次」会补全药名)",
+                  s_pendingName);
 }
 
 /* 24 小时窗口内的次数; 窗口没开、时间不可用、或窗口已过期都算 0 */
@@ -592,6 +648,45 @@ static bool hasDrugSuffix(const std::string &t)
     return false;
 }
 
+/* 「整句是不是单纯在说频率」—— 只有这种句子才敢把药名补成"刚拍的那味"。
+ *
+ * ⚠️ 不能只靠「找不到药名就补」: 用户说的是**另一味药**(「藿香正气水一天两次」),
+ *    那味药不在表里、匹配不到 idx, 也一样会走到补全那一步 —— 方案就被记到
+ *    刚拍的药头上, 而且不报错。所以反过来只放行纯频率句: 整句必须全部由
+ *    数字/中文数字/频率词/剂量词/服用动词/标点组成, 混进任何一个别的字就不补,
+ *    退回"没听清"+引导句。用户照引导句说一遍即可 ——
+ *    漏补一次只是多说一遍, 记错药是要吃错药的。
+ *
+ * (其实"匹配不到药名"本身就说明这半句不是药名: 表里存的药名都在第一遍匹配里试过) */
+static bool isPureFreqPhrase(const std::string &t)
+{
+    static const char *const kOk[] = {
+        "一", "二", "两", "三", "四", "五", "六", "七", "八", "九", "十",  // 中文数字
+        "每", "天", "日", "次",                                        // 频率词
+        "顿", "片", "粒", "支", "袋", "瓶",                             // 剂量词
+        "吃", "服", "喝", "滴", "喷", "贴", "用",                        // 服用动词(同 hasEat)
+        "，", ",", "。", ".", "、", " ",                                // 标点/空格
+    };
+    for (size_t i = 0; i < t.size(); ) {
+        const unsigned char c = (unsigned char)t[i];
+        if (c < 0x80) {                        // ASCII: 只放行数字和半角标点/空格
+            if (!((c >= '0' && c <= '9') || c == ' ' || c == '.' || c == ','))
+                return false;
+            i++;
+            continue;
+        }
+        /* 白名单全是单字(3 字节), 逐字比对不会切坏字符;
+           4 字节(emoji)之类在这里必然比不中 -> 直接拒绝, 也不会错位前进 */
+        bool hit = false;
+        for (size_t k = 0; k < sizeof(kOk) / sizeof(kOk[0]); k++) {
+            if (t.compare(i, 3, kOk[k]) == 0) { hit = true; break; }
+        }
+        if (!hit) return false;
+        i += 3;
+    }
+    return true;
+}
+
 std::string medHandleUtterance(const char *text)
 {
     MedGuard g;
@@ -602,6 +697,9 @@ std::string medHandleUtterance(const char *text)
     /* 先在已有记录里找药名 —— 找不到就什么都做不了 */
     MedItem items[MED_MAX_ITEMS];
     const int n = medLoad(items, MED_MAX_ITEMS);
+
+    /* 刚拍的那味药在不在表里 —— 两处要用: 无药名方案句补全药名 / 匹配不上时的引导 */
+    const int pendIdx = findPending(items, n);
 
     int idx = -1;
     for (int i = 0; i < n; i++) {
@@ -648,6 +746,13 @@ std::string medHandleUtterance(const char *text)
                       have + "注意别吃错药。";
         } else if (hasDrugSuffix(s)) {
             noMatch = "听出来是个药, 但它不在你的用药记录里。" + have + "注意别吃错药。";
+        } else if (pendIdx >= 0) {
+            /* 刚拍完药、用户却说了一句别的 —— 顺手把"怎么给这盒药录方案"说清楚:
+               这是「拍照 -> 录音」流程里最容易卡住的一步(见 med.h)。
+               ⚠️ 必须排在上面两条"吃错药"警告**之后**: 报警比引导更该被听到。
+               (这里不接 have 列表: 药名已在这句里, 再念一遍"已记录的有"是重复) */
+            noMatch = "刚拍了「" + std::string(items[pendIdx].name) +
+                      "」—— 按住 BOOT 说一句「一天两次」就能给它录方案。";
         } else {
             noMatch = "没听清是什么药。" + have;
         }
@@ -709,9 +814,28 @@ std::string medHandleUtterance(const char *text)
     /* ③ 方案: 只改次数。时段串**保持原样** —— 以前这里传的是 "",
        经 medAdd 一存就把之前记好的时段抹掉了 */
     if (isPlan) {
+        /* 句子里没有药名时, 用「刚拍的那味药」补上 —— 拍照入库的药是 perDay=0,
+           屏幕和喇叭都提示用户「说一句一天两次」, 而那句话里没有药名,
+           不补这一下用户照提示做也永远录不进方案(见 med.h 的 medSetPendingDrug)。
+           ⚠️ 必须同时要求"整句就是纯频率说法": 用户说**别的药名**时 idx 也是 -1
+              (那味药不在表里), 不拦就会把方案记到刚拍的药头上 —— 记错药是大事。
+              (s2 在 idx<0 时就是 s 本身, 这里用哪个都一样) */
+        bool fromPending = false;
+        if (idx < 0 && pendIdx >= 0 && isPureFreqPhrase(s)) {
+            idx         = pendIdx;
+            fromPending = true;
+        }
         if (idx < 0) return noMatch;
+
         items[idx].perDay = (uint8_t)perDay;
         if (!saveItems(items, n)) return "方案没存进去 (NVS 写入失败)。";
+
+        /* 方案真落盘了才消费这次拍照机会 —— "成功录入"的唯一定义:
+           光提到药名(「阿莫西林吃了」之后)不算, 用户可能待会儿才说次数;
+           给别的药设方案也不动它。 */
+        if (fromPending || nameMatch(items[idx].name, s_pendingName)) pendingClear();
+        if (fromPending) ESP_LOGI(TAG, "[MED] 用刚拍的药补全药名: %s", items[idx].name);
+
         return std::string(items[idx].name) + ": 方案已记下 —— 一天 " +
                std::to_string(perDay) + " 次";
     }

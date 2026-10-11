@@ -264,9 +264,9 @@ static void displayInit()
 static bool testWaitButton()
 {
     for (;;) {
-        if (gpio_get_level((gpio_num_t)BUTTON_PIN) == 0) {
+        if (buttonDown()) {
             const uint32_t t0 = millis();
-            while (gpio_get_level((gpio_num_t)BUTTON_PIN) == 0) {
+            while (buttonDown()) {
                 if (millis() - t0 >= BTN_HOLD_TEST_MS) return true;
                 delay(10);
             }
@@ -766,9 +766,16 @@ static void drawVoiceResult(const char *heard, const char *reply)
 static const char ASK_PROMPT[] =
     "这是什么？用一句中文直接回答，不超过20字，不要客套和多余解释。";
 #else
-/* 正常模式: 只认药名 —— 问得越窄, 回答越短, token 越省, 也好做本地匹配 */
+/* 正常模式: 只认药名 —— 问得越窄, 回答越短, token 越省, 也好做本地匹配。
+ *
+ * ⚠️ 2026-10-11 加强(现场倒装拍摄): 提示词里点明"可能倾斜/倒置、逐字辨认、
+ *    注意形近字"。PC 对照实验(见 CLAUDE.md 坑 #19): 倒置图上这层只把
+ *    "3 次全错"缓成"1/3 对"—— 主力是 SHOT_ROT180 把图转正, 这层是兜底;
+ *    图转正后加上它稳定不劣化。形近字的例子写「氯/氟」, 就是实测认错的那对。 */
 static const char ASK_PROMPT[] =
     "这是什么药？只回答药品的名称，不要剂量、用途、厂家或任何其他内容。"
+    "照片可能倾斜、倒置或光线不好，请逐字仔细辨认包装上的药名，"
+    "注意区分字形相近的字（如“氯”和“氟”），不要凭印象猜测。"
     "如果包装上的药名看不清或不确定，只回答三个字：看不清。";
 #endif
 
@@ -826,6 +833,33 @@ static std::string cleanDrugName(const std::string &raw)
     }
     return s;
 }
+
+/* 药名纠错 —— 模型在图像不佳时**不报"看不清", 而是理直气壮地认错字**。
+ *
+ * 实测(2026-10-11): 「盐酸氯环利嗪片」被读成「盐酸氟环利嗪片」。
+ * ⚠️ 氯/氟在药名里**都是真实存在的字**(氯雷他定 vs 氟康唑就是两个不同的药),
+ *    所以**绝不能做全局替换**, 只能按"实测遇到过的错型"整词纠正。
+ *
+ * ⚠️ 加新条目必须从**实测**总结(先在 PC 上拿 /photo 的实拍图复现确认, 见坑 #19),
+ *    凭想象加映射会凭空造出新的错药名。
+ * ⚠️ 这层只是**兜底**: 主要防线是 SHOT_ROT180(把图转正) + 提示词; 命中的话
+ *    runCaptureAsk 里会打日志, 上机时可以确认它到底有没有在工作。 */
+static const struct { const char *from; const char *to; } kNameFix[] = {
+    { "氟环利嗪", "氯环利嗪" },
+};
+
+static std::string fixDrugName(const std::string &s)
+{
+    std::string out = s;
+    for (size_t i = 0; i < sizeof(kNameFix) / sizeof(kNameFix[0]); i++) {
+        const size_t fl = strlen(kNameFix[i].from);
+        size_t p;
+        while ((p = out.find(kNameFix[i].from)) != std::string::npos) {
+            out.replace(p, fl, kNameFix[i].to);
+        }
+    }
+    return out;
+}
 #endif  /* !IS_TEST */
 
 static void runCaptureAsk()
@@ -851,11 +885,32 @@ static void runCaptureAsk()
            而拍照是唯一能把药名自动"采"进表里的入口 —— 表空着的时候,
            语音说「XX 一天两次」只会得到一句「还没记录任何药」。
            ⚠️ 只在**不存在**时新增: medAdd 对已存在的药是"更新方案",
-           直接调会把用户已经说好的「一天两次」冲成 0。 */
-        const std::string drugName = looksLikeNotADrug(r.text) ? std::string()
-                                                                : cleanDrugName(r.text);
-        if (!drugName.empty() && medFind(drugName.c_str()) < 0) {
-            medAdd(drugName.c_str(), 0, nullptr);
+           直接调会把用户已经说好的「一天两次」冲成 0(靠短路求值保证)。 */
+        std::string drugName = looksLikeNotADrug(r.text) ? std::string()
+                                                         : cleanDrugName(r.text);
+
+        /* 形近字纠错(表见 kNameFix)。纠错前先打日志 —— 上机时靠这行确认
+           这层到底有没有在工作, 别去猜 */
+        {
+            const std::string fixed = fixDrugName(drugName);
+            if (fixed != drugName) {
+                ESP_LOGI(TAG, "[MED] 药名纠错: 「%s」->「%s」",
+                              drugName.c_str(), fixed.c_str());
+                drugName = fixed;
+            }
+        }
+
+        if (!drugName.empty()) {
+            /* inTable = 这味药现在一定在表里(新加的, 或本来就有)。
+               ⚠️ medAdd 失败(名字过长/表满/NVS 写失败)时是 false —— 那种情况
+                  不设 pending: 药不在表里, 引导句「说一句一天两次」会骗用户白说。 */
+            const bool inTable = (medFind(drugName.c_str()) >= 0) ||
+                                 medAdd(drugName.c_str(), 0, nullptr);
+
+            /* ★ 记住「刚拍的这味药」: 用户待会儿按住 BOOT 说「一天两次」时,
+               那句话里没有药名, 靠它补全(见 med.h 的 medSetPendingDrug)。
+               拍照没认出药名时不调用 —— 上一次的机会保留。 */
+            if (inTable) medSetPendingDrug(drugName.c_str());
         }
 
         const std::string advice = drugName.empty()
@@ -913,7 +968,7 @@ static void handleBootButton()
     static uint32_t firstTapUp = 0;       // 第一击松开的时刻; 0 = 没有挂起的单击
     static bool     wasBusy    = false;
 
-    const bool     now = (gpio_get_level((gpio_num_t)BUTTON_PIN) == 0);
+    const bool     now = buttonDown();
     const uint32_t t   = millis();
 
     /* ---- 语音会话进行中: 按键归语音 task ---- */
@@ -940,7 +995,7 @@ static void handleBootButton()
         /* 阻塞期间手可能又按下了 —— 等它松开。否则手还按着会被当成新的按下,
            接着按住又变成一次莫名其妙的录音 */
         const uint32_t t0 = millis();
-        while (gpio_get_level((gpio_num_t)BUTTON_PIN) == 0 && millis() - t0 < 5000) delay(10);
+        while (buttonDown() && millis() - t0 < 5000) delay(10);
         down = false; holdFired = false;
         return;
     }
@@ -1029,12 +1084,24 @@ void setup()
     gpio_config_t bootCfg = {};
     bootCfg.pin_bit_mask = 1ULL << BUTTON_PIN;
     bootCfg.mode         = GPIO_MODE_INPUT;
+    /* ⚠️ 上拉**不能**跟着按键极性走: 按钮接 GND 的（常开、常闭都是）一律要上拉 ——
+       常闭按钮按下时触点断开, 正是靠这个上拉才能读到高电平。
+       只有"按钮接 3V3"那种接法才要改成下拉, 见 pins.h 的 BUTTON_ACTIVE_LOW */
     bootCfg.pull_up_en   = GPIO_PULLUP_ENABLE;
     bootCfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
     bootCfg.intr_type    = GPIO_INTR_DISABLE;
     gpio_config(&bootCfg);
 
-    const bool bootHeld = (gpio_get_level((gpio_num_t)BUTTON_PIN) == 0);
+    /* 开机把按键的空闲电平打出来 —— 换了按钮就靠这行确认极性对不对:
+       不碰按钮时, 这行应该跟"按下应为"**相反**。一样的话就把 pins.h 的
+       BUTTON_ACTIVE_LOW 反过来。 */
+    ESP_LOGI(TAG, "[SYS] 按键 GPIO%d 空闲电平=%d (按下应为 %d)",
+                  BUTTON_PIN, gpio_get_level((gpio_num_t)BUTTON_PIN),
+                  BUTTON_ACTIVE_LOW ? 0 : 1);
+
+    /* 按住按键上电 -> 屏幕测试模式。
+       以前这里写死成 0 是绕开"换了极性相反的按钮"——现在交给 BUTTON_ACTIVE_LOW 管 */
+    const bool bootHeld = buttonDown();
     if (bootHeld) ESP_LOGI(TAG, "[SYS] 检测到 BOOT 按下 -> 纯屏幕测试模式");
 
     ESP_LOGI(TAG, "[SYS] PSRAM: %u KB, 可用堆: %u KB",

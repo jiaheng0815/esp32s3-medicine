@@ -1,4 +1,5 @@
 #pragma once
+#include <driver/gpio.h>     // buttonDown() 要用 gpio_get_level
 /* ============================================================
  * 全项目的引脚定义 —— **只在这一处**。
  *
@@ -77,3 +78,24 @@
  *    跟着新脚走, 见 main.cpp 的 bootHeld); **烧录不受影响** —— 板上是 CH340,
  *    用 DTR/RTS 自动进下载模式, 不需要按键配合。 */
 #define BUTTON_PIN       3
+
+/* 按键极性: 按下时引脚读到**低**还是**高**。
+ * 按钮本身没有极性, 由"接 GND 还是 3V3" + "常开还是常闭"共同决定:
+ *
+ *   接 GND + 常开(NO, 最常见)  -> 松开=高 按下=低 -> BUTTON_ACTIVE_LOW = 1
+ *   接 GND + 常闭(NC)          -> 松开=低 按下=高 -> BUTTON_ACTIVE_LOW = 0   ← 当前这块按钮
+ *   接 3V3 + 常开              -> 松开=低 按下=高 -> 0  (还要把 setup() 里的上拉改成下拉)
+ *
+ * ⚠️ 全项目读按键**只走下面这个 buttonDown()**, 别再满世界写 gpio_get_level()。
+ *    以前那 11 处散在各文件里, 换一次按钮要改 11 个地方 ——
+ *    漏一处就变成"按住能拍照、松手才录音"这种极难查的现象。
+ *
+ * ⚠️ 常闭按钮有个副作用: **线一断, 引脚被上拉 = 永远"按住"** ——
+ *    录音会停不下来。要是手头有常开按钮, 换掉更稳。 */
+#define BUTTON_ACTIVE_LOW  0     // ← 换按钮就改这一行
+
+inline bool buttonDown()
+{
+    const int lv = gpio_get_level((gpio_num_t)BUTTON_PIN);
+    return BUTTON_ACTIVE_LOW ? (lv == 0) : (lv != 0);
+}
