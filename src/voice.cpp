@@ -109,14 +109,27 @@ static std::string buildHotwords()
 
 /* TTS 播放缓冲。
  *
- * ⚠️ 512KB **不够** —— 2026-10-06 实测: 一句 6 秒的「语音测试成功，你好世界，
- * hello world」解出来正好撑满 512KB 还没完(共 162 个 chunk), 说明 GLM-TTS 返回的
- * WAV 比按"24kHz 单声道 48KB/s"算出来的大得多(多半是立体声)。
- * 给 2MB: 够 11 秒的 44.1kHz 立体声, PSRAM 也放得下。
+ * ⚠️ 512KB **不够** —— 2026-10-06 实测撑满还没完(见 CLAUDE.md 坑 #14;
+ *    后来查明是**单声道** 48KB/s, 是文本比当年预想的长, 不是立体声)。
+ *
+ * 2MB -> **3MB**(2026-10-11): 识药问答改版后播报变长, 最长一档(药名+用途+
+ * 添加引导+免责 ≈ 150 字)按实测语速约 3 字/秒 ≈ 50 秒 ≈ 2.3MB —— 正好压在 2MB 上,
+ * 尾部会被 readChunkedToBuffer 截掉,**症状就是"吐字不完全"**。
+ * 3MB = 62 秒, 留 20% 余量。
+ * ⚠️ 别再加太大: 它是开机常驻的, 和拍照链路的 framebuffer/jpg/base64
+ *    (峰值约 3.3MB) 同时存在于 8MB PSRAM 里。
  *
  * 多分配 1 字节是为了出错时能塞个 '\0' 把响应体当字符串打出来。 */
-#define TTS_BUF_BYTES    (2 * 1024 * 1024)
-#define TTS_MAX_CHARS    100            // 播报文本上限(按字符计费, 提醒本来就该短)
+#define TTS_BUF_BYTES    (3 * 1024 * 1024)
+
+/* 播报文本上限。100 -> 130(2026-10-11): 最长的一档是"药名+用途+添加引导"
+ * (药名≤10字 + 用途~50字 + 引导~35字) + 免责 20 字 —— 100 会把引导语尾巴砍掉。
+ * ⚠️ 三层截断点要一起看, 任何一层小了都表现为"播出的声音缺尾巴":
+ *    ① voiceSpeakAsync 的 s_pending(VOICE_REPLY_MAX, voice.h)
+ *    ② 这里(文本层)
+ *    ③ TTS_BUF_BYTES(音频层)
+ * 130 字 × 3 字节 = 390 字节, 所以 VOICE_REPLY_MAX 也同步加到了 512。 */
+#define TTS_MAX_CHARS    130
 
 /* 录音电平每块更新一次; 2048 字节 = 1024 采样 @16k = 64ms */
 #define MIC_BLOCK_BYTES  2048
@@ -757,8 +770,13 @@ static size_t readChunkedToBuffer(WiFiClientSecure &c, uint8_t *dst, size_t cap,
         c.readStringUntil('\n');                         // 块尾的 \r\n
     }
 
-    ESP_LOGI(TAG, "[TTS] chunked 解出 %u 字节, 共 %d 块%s",
-                  (unsigned)out, chunks, timedOut ? " (超时退出!)" : "");
+    /* ⚠️ 撞到缓冲上限原来是**静默** break 的 —— 症状是"播出来缺尾巴",
+       但日志上看不出原因。现在明确报警, 上机一看就知道该加大 TTS_BUF_BYTES。 */
+    const bool bufFull = (out >= cap);
+    ESP_LOGI(TAG, "[TTS] chunked 解出 %u 字节, 共 %d 块%s%s",
+                  (unsigned)out, chunks,
+                  bufFull ? " (!! 缓冲满, 音频被截断 —— 加大 TTS_BUF_BYTES)" : "",
+                  timedOut ? " (超时退出!)" : "");
     return out;
 }
 

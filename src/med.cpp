@@ -18,24 +18,9 @@ static const char *TAG = "med";    // 日志标签
    不是滚动的 24 小时 —— 见 med.h 里 MedItem 那段说明。 */
 #define MED_WINDOW_SEC  (24UL * 60 * 60)
 
-/* 拍照后「这味药等你录方案」的机会保留多久(见 medSetPendingDrug)。
-   用 millis() 而不是 medNow(): 这是"刚拍完这几分钟"的相对时间, 和设备
-   有没有对上 NTP 无关; 比较用无符号差值, millis 回绕也不会算错。 */
-#define MED_PENDING_TTL_MS  (5UL * 60 * 1000)
-
 /* 整张表在这个静态缓冲里读写过一次。放静态区而不是栈上 ——
    3900 字节的栈数组会直接把 loopTask 的栈顶穿 */
 static char s_blob[MED_BLOB_MAX];
-
-/* ==================== 刚拍到的药 ====================
- * 拍照识别成功后由 medSetPendingDrug() 记下药名, 等用户用一句
- * 「一天两次」补全方案(为什么需要, 见 med.h)。
- *
- * ⚠️ 和 s_blob 一样是**多 task 共享**的: loopTask 拍照时写, voiceTask
- *    (优先级 3) 和 webui 说话时读 —— 所以只在持有 MedGuard 时访问。 */
-static char     s_pendingName[MED_NAME_LEN];
-static uint32_t s_pendingAtMs;      // 记下的时刻 (millis)
-static bool     s_pending;          // false = 没有待补全的药
 
 /* ==================== 互斥锁 ====================
  * s_blob 是**所有函数共用**的一块静态缓冲: medLoad 从它解析, saveItems 往里拼。
@@ -189,30 +174,6 @@ static bool nameMatch(const char *a, const char *b)
     return a && b && *a && *b && (strstr(a, b) || strstr(b, a));
 }
 
-/* ---- 刚拍到的药: 三个只在 MedGuard 保护下调的小工具 ---- */
-
-/* 机会还在有效期内吗。无符号差值, millis 回绕(约 49.7 天)也不会算错 */
-static bool pendingFresh()
-{
-    return s_pending && (uint32_t)(millis() - s_pendingAtMs) < MED_PENDING_TTL_MS;
-}
-
-/* 刚拍的那味药在 items 里的下标; 没有/过期/已被删掉都返回 -1 */
-static int findPending(const MedItem *items, int n)
-{
-    if (!pendingFresh()) return -1;
-    for (int i = 0; i < n; i++) {
-        if (nameMatch(items[i].name, s_pendingName)) return i;
-    }
-    return -1;
-}
-
-static void pendingClear()
-{
-    s_pending        = false;
-    s_pendingName[0] = '\0';
-}
-
 /* ==================== 常见药名(内置表) ==================== */
 static const char *const kCommonDrugs[] = {
     "阿莫西林", "头孢", "阿奇霉素", "左氧氟沙星", "布洛芬", "对乙酰氨基酚",
@@ -324,21 +285,36 @@ bool medAdd(const char *name, uint8_t perDay, const char *slots)
     return saveItems(items, n + 1);
 }
 
-/* 记住刚拍照认出来的药 —— 见 med.h 的说明(含"调用前确认药在表里")。 */
-void medSetPendingDrug(const char *name)
+/* ==================== 药名纠错 ==================== */
+
+/* 药名纠错表。⚠️ 加条目必须从**实测**总结(先在 PC 上用实拍图复现确认, 见坑 #19),
+ * 凭想象加映射会凭空造出新的错药名。
+ *
+ * 条目来源(都是实测):
+ *   · 拍照: glm 在图像不佳时把「盐酸氯环利嗪片」读成「盐酸氟环利嗪片」(坑 #19)
+ *   · 语音: ASR 对「嗪」这个字几乎必错 —— 转成「睛」(2026-10-11 实测)
+ *     或「晴」(坑 #18 的「酸氯环利晴片」)
+ *
+ * ⚠️ 氯/氟、睛/晴 在别的药名里**都是真实存在的字**(氯雷他定 vs 氟康唑是两个
+ *    不同的药), 所以**绝不能做全局单字替换**, 只能按实测错型整片段纠正。
+ * ⚠️ 两个入口都会调它: 拍照(runCaptureAsk)和语音(剂量句剥名后)。 */
+static const struct { const char *from; const char *to; } kNameFix[] = {
+    { "氟环利嗪", "氯环利嗪" },
+    { "氯环利睛", "氯环利嗪" },
+    { "氯环利晴", "氯环利嗪" },
+};
+
+std::string medFixDrugName(const std::string &s)
 {
-    MedGuard g;
-    if (!name || !*name) return;            // 传空名 = 不改变现状(拍糊时保留旧机会)
-
-    char clean[MED_NAME_LEN * 2];           // 先粗筛, 后面 utf8SafeCopy 再按字符边界截
-    sanitizeName(clean, sizeof(clean), name);
-    if (!clean[0]) return;
-
-    utf8SafeCopy(s_pendingName, sizeof(s_pendingName), clean);
-    s_pendingAtMs = millis();
-    s_pending     = true;
-    ESP_LOGI(TAG, "[MED] 记住刚拍的药: %s (5 分钟内说「一天两次」会补全药名)",
-                  s_pendingName);
+    std::string out = s;
+    for (size_t i = 0; i < sizeof(kNameFix) / sizeof(kNameFix[0]); i++) {
+        const size_t fl = strlen(kNameFix[i].from);
+        size_t p;
+        while ((p = out.find(kNameFix[i].from)) != std::string::npos) {
+            out.replace(p, fl, kNameFix[i].to);
+        }
+    }
+    return out;
 }
 
 /* 24 小时窗口内的次数; 窗口没开、时间不可用、或窗口已过期都算 0 */
@@ -566,7 +542,10 @@ static int parsePerDay(const std::string &s)
 static std::string adviceFor(const MedItem &it)
 {
     if (it.perDay == 0) {
-        return std::string(it.name) + ": 还没录入用药方案 —— 按住 BOOT 说一句, 比如「一天两次」。";
+        /* ⚠️ 引导语必须**带上药名**: 拍照不再写表后, 不带药名的「一天两次」
+           没有可挂靠的目标(老 pending 机制已移除), 说了也录不进去 */
+        return std::string(it.name) + ": 还没录入用药方案。按住按钮说「" +
+               it.name + " 一天两次」，就能录。";
     }
     if (it.lastTaken == 0) {
         return std::string(it.name) + ": 按方案一天 " + std::to_string(it.perDay) +
@@ -648,43 +627,162 @@ static bool hasDrugSuffix(const std::string &t)
     return false;
 }
 
-/* 「整句是不是单纯在说频率」—— 只有这种句子才敢把药名补成"刚拍的那味"。
+/* 从方案句里剥出药名 —— 语音**添加新药**靠它。
  *
- * ⚠️ 不能只靠「找不到药名就补」: 用户说的是**另一味药**(「藿香正气水一天两次」),
- *    那味药不在表里、匹配不到 idx, 也一样会走到补全那一步 —— 方案就被记到
- *    刚拍的药头上, 而且不报错。所以反过来只放行纯频率句: 整句必须全部由
- *    数字/中文数字/频率词/剂量词/服用动词/标点组成, 混进任何一个别的字就不补,
- *    退回"没听清"+引导句。用户照引导句说一遍即可 ——
- *    漏补一次只是多说一遍, 记错药是要吃错药的。
+ * 为什么需要: 拍照路径现在只识别不写表(见 main.cpp 的 runCaptureAsk),
+ * 用户听到"这个药不在你的用药方案"的引导后, 说的那句
+ * 「盐酸氯环利嗪片一天两次」就是把这味药加进方案的唯一方式。
  *
- * (其实"匹配不到药名"本身就说明这半句不是药名: 表里存的药名都在第一遍匹配里试过) */
-static bool isPureFreqPhrase(const std::string &t)
+ * 剥法(以 "我想添加布洛芬一天两次吧" 为例):
+ *   ① 剥频率短语: "一天/每天/一日/每日" 最早出现处 -> 一路剥到后面的第一个"次"
+ *   ② 剥头部动词("我想添加/添加/新增/加入/录入"...) —— 用户听了引导很容易
+ *      顺口说"添加布洛芬一天两次", 不剥的话药名就成了"添加布洛芬"
+ *   ③ 剥尾部语气词("吧/哦/啊/呢"...) —— 同理, 名字里带"吧"会污染热词和匹配
+ *
+ * ⚠️ 剥完的合理性检查: 少于 2 个汉字(6 字节)当失败 —— "一天吃两次饭" 会剥出
+ *    "饭", 那是误添加。宁可让用户重说, 也不能往表里塞垃圾名。
+ * ⚠️ 只在 hasFreq(有"一天"这种锚) 的句子上调用 —— 没锚点的句子剥不干净。 */
+static std::string drugNameFromPlanPhrase(const std::string &s)
 {
-    static const char *const kOk[] = {
-        "一", "二", "两", "三", "四", "五", "六", "七", "八", "九", "十",  // 中文数字
-        "每", "天", "日", "次",                                        // 频率词
-        "顿", "片", "粒", "支", "袋", "瓶",                             // 剂量词
-        "吃", "服", "喝", "滴", "喷", "贴", "用",                        // 服用动词(同 hasEat)
-        "，", ",", "。", ".", "、", " ",                                // 标点/空格
+    /* ① 剥频率短语 */
+    static const char *const kStart[] = { "一天", "每天", "一日", "每日" };
+    size_t p1 = std::string::npos;
+    for (size_t i = 0; i < sizeof(kStart) / sizeof(kStart[0]); i++) {
+        const size_t p = s.find(kStart[i]);
+        if (p != std::string::npos && (p1 == std::string::npos || p < p1)) p1 = p;
+    }
+    if (p1 == std::string::npos) return "";
+
+    const size_t ci = s.find("次", p1);             // 频率短语的终点
+    if (ci == std::string::npos) return "";
+
+    std::string out = s.substr(0, p1) + s.substr(ci + strlen("次"));
+    strTrim(out);
+
+    /* ② 剥头部动词(长的先试) */
+    static const char *const kVerb[] = {
+        "我想添加", "我要添加", "帮我添加", "我想加", "我要加",
+        "添加", "新增", "加入", "录入",
     };
-    for (size_t i = 0; i < t.size(); ) {
-        const unsigned char c = (unsigned char)t[i];
-        if (c < 0x80) {                        // ASCII: 只放行数字和半角标点/空格
-            if (!((c >= '0' && c <= '9') || c == ' ' || c == '.' || c == ','))
-                return false;
+    for (size_t i = 0; i < sizeof(kVerb) / sizeof(kVerb[0]); i++) {
+        const std::string v = kVerb[i];
+        if (out.size() > v.size() && out.compare(0, v.size(), v) == 0) {
+            out.erase(0, v.size());
+            strTrim(out);
+            break;
+        }
+    }
+
+    /* ③ 剥尾部语气词(剥一层可能露出来下一层, 循环到剥不动为止) */
+    static const char *const kTail[] = { "谢谢", "吧", "哦", "啊", "呢", "嘛", "嗯" };
+    for (bool again = true; again; ) {
+        again = false;
+        for (size_t i = 0; i < sizeof(kTail) / sizeof(kTail[0]); i++) {
+            const std::string t = kTail[i];
+            if (out.size() > t.size() &&
+                out.compare(out.size() - t.size(), t.size(), t) == 0) {
+                out.erase(out.size() - t.size());
+                strTrim(out);
+                again = true;
+                break;
+            }
+        }
+    }
+
+    /* ④ 只保留药名会出现的字符(汉字/字母/数字), 标点全剔掉 ——
+       ASR 转写会带标点("盐酸氯环利晴片，。"), 不去的话会连着标点原样存进表,
+       之后热词表、所有匹配都跟着歪(2026-10-11 实测踩过: 表里真进了
+       「盐酸氯环利晴片，。」这条记录)。 */
+    std::string keep;
+    keep.reserve(out.size());
+    for (size_t i = 0; i < out.size(); ) {
+        const unsigned char c = (unsigned char)out[i];
+        if (c < 0x80) {                             // ASCII: 只留字母数字
+            if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                (c >= 'a' && c <= 'z'))
+                keep += (char)c;
             i++;
             continue;
         }
-        /* 白名单全是单字(3 字节), 逐字比对不会切坏字符;
-           4 字节(emoji)之类在这里必然比不中 -> 直接拒绝, 也不会错位前进 */
-        bool hit = false;
-        for (size_t k = 0; k < sizeof(kOk) / sizeof(kOk[0]); k++) {
-            if (t.compare(i, 3, kOk[k]) == 0) { hit = true; break; }
+        if (c >= 0xF0) { i += 4; continue; }        // 4 字节(emoji 等) -> 去
+        if ((c & 0xE0) == 0xC0) {                   // 2 字节(拉丁扩展) -> 留
+            keep.append(out, i, 2);
+            i += 2;
+            continue;
         }
-        if (!hit) return false;
+        /* 3 字节: 按首/次字节粗筛标点(去), 其余当汉字(留)。
+           CJK 标点在 U+3000~303F(E3 80 xx)、通用标点/引号在 U+2000~203F(E2 80 xx)、
+           全角形在 U+FF00~FFEF(EF xx xx) —— 宁可多剔一点, 漏剔会写进 NVS */
+        const unsigned char c2 = (i + 1 < out.size()) ? (unsigned char)out[i + 1] : 0;
+        if (!((c == 0xE3 && c2 == 0x80) || (c == 0xE2 && c2 == 0x80) || c == 0xEF))
+            keep.append(out, i, 3);
         i += 3;
     }
-    return true;
+    out.swap(keep);
+
+    if (out.size() < 6) return "";                  // 少于 2 个汉字当剥失败
+    return out;
+}
+
+/* UTF-8 字符的字节长度(按首字节判; 非法字节当 1 前进, 不会死循环) */
+static int utf8CharLen(const char *p)
+{
+    const unsigned char c = (unsigned char)*p;
+    if (c < 0x80)           return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+/* 模糊匹配: 在句子 s 里找"和 name 只差**一个字符**"的连续片段(替换型)。
+ *
+ * 动机: ASR 对药名里的生僻字几乎必错 —— 实测「嗪」稳定被转成「睛/晴」
+ * (坑 #18 的「酸氯环利晴片」、2026-10-11 的「盐酸氯环利睛片」都是它)。
+ * 用户说的一定就是表里那味药, 精确匹配却全军覆没, 只能回"没听清"。
+ *
+ * ⚠️ 只做**长度相同、恰一个字符不同**这一种: 表内药名彼此都差好几个字,
+ *    误配率极低; 插入/删除型(长度不同)误配风险大得多, 不做。
+ * ⚠️ 只对 **3 字符以上**的名字生效: "钙片"这种短名差一个字就面目全非。
+ *
+ * 命中返回起始**字节**偏移, *outLen 回填句子里命中段的字节长度(给 s2 擦除用 ——
+ * 是错字那段实际长度, 和 name 的长度可能不同); 没命中返回 -1。 */
+static long fuzzyNamePos(const std::string &s, const char *name, size_t *outLen)
+{
+    int nName = 0;                                  // 药名的字符数
+    for (const char *p = name; *p; p += utf8CharLen(p)) nName++;
+    if (nName < 3) return -1;
+
+    /* 句子的字符起点(字节偏移)。⚠️ 用 uint16 不用 size_t —— 这里在 loopTask
+       的 8KB 栈上执行(网页 /say 路径), size_t 版本要 768 字节, 它在坑 #21 的
+       爆栈预算里很金贵。偏移只记录前 96 个字符, 最大 ≤ 96×4 字节, uint16 绰绰有余 */
+    uint16_t offs[96];
+    int    nOffs = 0;
+    for (size_t i = 0; i < s.size() && nOffs < 96; ) {
+        offs[nOffs++] = i;
+        i += utf8CharLen(s.c_str() + i);
+    }
+
+    for (int i = 0; i + nName <= nOffs; i++) {
+        const char *sp   = s.c_str() + offs[i];
+        const char *np   = name;
+        int         diff = 0;
+        size_t      used = 0;
+        for (int k = 0; k < nName; k++) {
+            const int sl = utf8CharLen(sp + used);
+            const int nl = utf8CharLen(np);
+            if (sl != nl || memcmp(sp + used, np, sl) != 0) {
+                if (++diff > 1) break;              // 差两个字符以上, 不是它
+            }
+            used += sl;
+            np   += nl;
+        }
+        if (diff <= 1) {                            // 完整比完且只差一个字符
+            if (outLen) *outLen = used;
+            return (long)offs[i];
+        }
+    }
+    return -1;
 }
 
 std::string medHandleUtterance(const char *text)
@@ -694,12 +792,9 @@ std::string medHandleUtterance(const char *text)
 
     const std::string s(text);
 
-    /* 先在已有记录里找药名 —— 找不到就什么都做不了 */
+    /* 先在已有记录里找药名 —— 找不到就看下面能不能"添加新药" */
     MedItem items[MED_MAX_ITEMS];
     const int n = medLoad(items, MED_MAX_ITEMS);
-
-    /* 刚拍的那味药在不在表里 —— 两处要用: 无药名方案句补全药名 / 匹配不上时的引导 */
-    const int pendIdx = findPending(items, n);
 
     int idx = -1;
     for (int i = 0; i < n; i++) {
@@ -722,6 +817,24 @@ std::string medHandleUtterance(const char *text)
         }
     }
 
+    /* 第三遍(模糊): 精确和"内置中介"都失败时, 试试"只差一个字符" ——
+       ASR 对药名里的生僻字几乎必错(实测「嗪」稳定转成「睛/晴」), 而用户说的
+       一定就是他表里那味药。见 fuzzyNamePos 的注释(为什么只做替换型、限 3 字以上)。 */
+    long   fuzzyPos = -1;
+    size_t fuzzyLen = 0;
+    if (idx < 0) {
+        for (int i = 0; i < n; i++) {
+            const long p = fuzzyNamePos(s, items[i].name, &fuzzyLen);
+            if (p >= 0) {
+                idx      = i;
+                fuzzyPos = p;
+                ESP_LOGI(TAG, "[MED] 模糊匹配: 「%s」≈ 表内「%s」(差一个字)",
+                              s.c_str(), items[i].name);
+                break;
+            }
+        }
+    }
+
     /* 匹配不上时的提示 —— 要分清**三种**情况, 它们该说的话完全不同, 混成一句
        「没听出是哪种药」会把最该报警的那种盖掉(实测踩过, 见 commonDrugIn 的注释):
          (a) 表里一条药都没有          -> 不是"没听出来", 是根本没东西可比
@@ -729,7 +842,7 @@ std::string medHandleUtterance(const char *text)
          (c) 真没听清                  -> 让它再说一遍 */
     std::string noMatch;
     if (n == 0) {
-        noMatch = "还没记录任何药 —— 先短按拍照识别药盒, 或者在网页上添加一条。";
+        noMatch = "还没记录任何药。按住按钮说「药名 一天两次」就能添加, 也可以在网页上添加。";
     } else {
         std::string have = "已记录的有: ";
         const int show = (n > 6) ? 6 : n;        // 要播报出来, 列太长听不完
@@ -746,13 +859,6 @@ std::string medHandleUtterance(const char *text)
                       have + "注意别吃错药。";
         } else if (hasDrugSuffix(s)) {
             noMatch = "听出来是个药, 但它不在你的用药记录里。" + have + "注意别吃错药。";
-        } else if (pendIdx >= 0) {
-            /* 刚拍完药、用户却说了一句别的 —— 顺手把"怎么给这盒药录方案"说清楚:
-               这是「拍照 -> 录音」流程里最容易卡住的一步(见 med.h)。
-               ⚠️ 必须排在上面两条"吃错药"警告**之后**: 报警比引导更该被听到。
-               (这里不接 have 列表: 药名已在这句里, 再念一遍"已记录的有"是重复) */
-            noMatch = "刚拍了「" + std::string(items[pendIdx].name) +
-                      "」—— 按住 BOOT 说一句「一天两次」就能给它录方案。";
         } else {
             noMatch = "没听清是什么药。" + have;
         }
@@ -764,8 +870,15 @@ std::string medHandleUtterance(const char *text)
        所以先把匹配到的药名从句子里删掉, 再做下面所有判断。 */
     std::string s2 = s;
     if (idx >= 0) {
+        /* 精确出现就精确删; 模糊命中的话删句子里**那段错字**
+           (按名字精确 find 找不到错字版本 —— 不擦掉的话, 名字里若带
+           "服/吃"这类关键词会干扰后面的意图判断) */
         const size_t p = s2.find(items[idx].name);
-        if (p != std::string::npos) s2.erase(p, strlen(items[idx].name));
+        if (p != std::string::npos) {
+            s2.erase(p, strlen(items[idx].name));
+        } else if (fuzzyPos >= 0) {
+            s2.erase((size_t)fuzzyPos, fuzzyLen);
+        }
     }
 
     /* ---- 意图判断 ----
@@ -814,28 +927,50 @@ std::string medHandleUtterance(const char *text)
     /* ③ 方案: 只改次数。时段串**保持原样** —— 以前这里传的是 "",
        经 medAdd 一存就把之前记好的时段抹掉了 */
     if (isPlan) {
-        /* 句子里没有药名时, 用「刚拍的那味药」补上 —— 拍照入库的药是 perDay=0,
-           屏幕和喇叭都提示用户「说一句一天两次」, 而那句话里没有药名,
-           不补这一下用户照提示做也永远录不进方案(见 med.h 的 medSetPendingDrug)。
-           ⚠️ 必须同时要求"整句就是纯频率说法": 用户说**别的药名**时 idx 也是 -1
-              (那味药不在表里), 不拦就会把方案记到刚拍的药头上 —— 记错药是大事。
-              (s2 在 idx<0 时就是 s 本身, 这里用哪个都一样) */
-        bool fromPending = false;
-        if (idx < 0 && pendIdx >= 0 && isPureFreqPhrase(s)) {
-            idx         = pendIdx;
-            fromPending = true;
+        /* 药名不在表里 —— 看这是不是一句"添加新药"的话("盐酸氯环利嗪片一天两次")。
+           拍照路径只识别不写表, 这句话就是唯一的自动添加入口: 拍照识别到方案外的
+           药时, 播报里教用户说的正是它(见 main.cpp 的 runCaptureAsk)。
+           ⚠️ 剥名字有失败面(剥不干净 / "一天吃两次饭"这种), 函数内做了合理性检查;
+              剥不出来就退回 noMatch 让用户重说 —— 宁可多问一遍, 也不能往药品表里
+              塞垃圾名(会污染 ASR 热词表和后续所有匹配)。
+           ⚠️ 疑问/否定句**不添加**: 「这个药能一天两次吗」会剥出"这个药能吗",
+              「布洛芬没吃一天两次」会剥出"布洛芬没吃" —— 这两类都回落 noMatch。
+              (② 分支只在 hasEat 时拦疑问/否定, 这里必须再拦一次) */
+        if (idx < 0 && hasFreq && !isQuestion && !hasNeg) {
+            /* 剥完先过药名纠错(ASR 的错字型, 见 kNameFix)再查表/入库 ——
+               不然「盐酸氯环利睛片一天两次」会新存一条错名记录 */
+            const std::string nm = medFixDrugName(drugNameFromPlanPhrase(s2));
+            if (!nm.empty()) {
+                /* 剥出的名字可能命中表里已有的药(用户只说了简称) —— 命中就回到
+                   "更新方案"的语义, 别按新药添加(那会多出一条重复记录) */
+                for (int i = 0; i < n; i++) {
+                    if (nameMatch(items[i].name, nm.c_str())) { idx = i; break; }
+                }
+                if (idx < 0) {
+                    /* ⚠️ 这里**内联**添加, 不能调 medAdd() —— medAdd 会再 medLoad()
+                       一份 items[MED_MAX_ITEMS](≈2.7KB), 叠在本函数自己那份上, 正好
+                       把 loopTask 的 8KB 栈打爆(实测 2026-10-11: 网页 /say 加新药
+                       两次全崩, Stack canary 触发; 语音 task 栈 12KB 侥幸活着)。
+                       见 CLAUDE.md 坑 #21。
+                       (nm 已经过 drugNameFromPlanPhrase 的字符过滤 + medFixDrugName,
+                        不含 | ; 等分隔符, 安全) */
+                    if (nm.size() >= MED_NAME_LEN) return "添加失败 —— 药名太长。";
+                    if (n >= MED_MAX_ITEMS)        return "添加失败 —— 药品表已满。";
+                    memset(&items[n], 0, sizeof(MedItem));
+                    utf8SafeCopy(items[n].name, MED_NAME_LEN, nm.c_str());
+                    items[n].perDay = (uint8_t)perDay;
+                    if (!saveItems(items, n + 1)) return "添加失败 (NVS 写入失败)。";
+                    ESP_LOGI(TAG, "[MED] 语音添加新药: %s (一天 %d 次)",
+                                  items[n].name, perDay);
+                    return std::string(items[n].name) + ": 已添加到用药方案 —— 一天 " +
+                           std::to_string(perDay) + " 次";
+                }
+            }
         }
         if (idx < 0) return noMatch;
 
         items[idx].perDay = (uint8_t)perDay;
         if (!saveItems(items, n)) return "方案没存进去 (NVS 写入失败)。";
-
-        /* 方案真落盘了才消费这次拍照机会 —— "成功录入"的唯一定义:
-           光提到药名(「阿莫西林吃了」之后)不算, 用户可能待会儿才说次数;
-           给别的药设方案也不动它。 */
-        if (fromPending || nameMatch(items[idx].name, s_pendingName)) pendingClear();
-        if (fromPending) ESP_LOGI(TAG, "[MED] 用刚拍的药补全药名: %s", items[idx].name);
-
         return std::string(items[idx].name) + ": 方案已记下 —— 一天 " +
                std::to_string(perDay) + " 次";
     }

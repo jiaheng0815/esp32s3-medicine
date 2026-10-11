@@ -769,16 +769,16 @@ static void drawVoiceResult(const char *heard, const char *reply)
 static const char ASK_PROMPT[] =
     "这是什么？用一句中文直接回答，不超过20字，不要客套和多余解释。";
 #else
-/* 正常模式(2026-10-11 改版): 「识药问答」——
- *   是药   -> 第一行药名 + 第二行用途; 设备端取第一行做药名(进表/热词), 整段播报
+/* 正常模式(2026-10-11 改版): 「普通识别」——
+ *   是药   -> 第一行药名 + 第二行用途; 设备端取第一行查药品表, 不在方案里就追加添加引导
  *   不是药 -> "这不是药物哦，这是一个xxx"(设备端靠"这不是药"分流)
  *   看不清 -> 只答"看不清"(设备端提示重拍)
- * PC 实测(glm-5.3-flash, 药图 3 次 / 非药图 2 次 / 模糊图 1 次): 三个分支都稳定服从。
+ * PC 实测(glm-5.3-flash 和 glm-5v-turbo 都验过): 三个分支都稳定服从。
  *
  * ⚠️「第一行只写药品名称」是给设备端**提取药名**用的 —— 改 prompt 时这句别丢,
- *    丢了 drugNameFromAnswer() 就永远拿到空串(也就是不再进表/pending)。
+ *    丢了 drugNameFromAnswer() 就永远拿到空串(方案检查/添加引导都会哑掉)。
  * ⚠️「注意区分字形相近的字」是坑 #19 的兜底(主力是 SHOT_ROT180 把图转正);
- *    「看清不」那条也要留 —— 没它模型会对糊图硬猜(实测: 糊图精确回"看不清")。 */
+ *    「看不清」那条也要留 —— 没它模型会对糊图硬猜(实测: 糊图精确回"看不清")。 */
 static const char ASK_PROMPT[] =
     "这是什么？如果是药品，第一行只写药品名称（不要任何标点、符号或别的字，"
     "注意区分字形相近的字，如“氯”和“氟”），第二行用一两句话说明它的用途。"
@@ -847,37 +847,13 @@ static std::string cleanDrugName(const std::string &raw)
     return s;
 }
 
-/* 药名纠错 —— 模型在图像不佳时**不报"看不清", 而是理直气壮地认错字**。
- *
- * 实测(2026-10-11): 「盐酸氯环利嗪片」被读成「盐酸氟环利嗪片」。
- * ⚠️ 氯/氟在药名里**都是真实存在的字**(氯雷他定 vs 氟康唑就是两个不同的药),
- *    所以**绝不能做全局替换**, 只能按"实测遇到过的错型"整词纠正。
- *
- * ⚠️ 加新条目必须从**实测**总结(先在 PC 上拿 /photo 的实拍图复现确认, 见坑 #19),
- *    凭想象加映射会凭空造出新的错药名。
- * ⚠️ 这层只是**兜底**: 主要防线是 SHOT_ROT180(把图转正) + 提示词; 命中的话
- *    runCaptureAsk 里会打日志, 上机时可以确认它到底有没有在工作。 */
-static const struct { const char *from; const char *to; } kNameFix[] = {
-    { "氟环利嗪", "氯环利嗪" },
-};
+/* 药名纠错(错型表 + medFixDrugName)挪到了 med.cpp —— 语音路径(剂量句剥名后)
+   也要用同一张表, 放一处维护(2026-10-11 挪的)。runCaptureAsk 里命中了会打日志。 */
 
-static std::string fixDrugName(const std::string &s)
-{
-    std::string out = s;
-    for (size_t i = 0; i < sizeof(kNameFix) / sizeof(kNameFix[0]); i++) {
-        const size_t fl = strlen(kNameFix[i].from);
-        size_t p;
-        while ((p = out.find(kNameFix[i].from)) != std::string::npos) {
-            out.replace(p, fl, kNameFix[i].to);
-        }
-    }
-    return out;
-}
-
-/* 从"第一行药名 + 第二行用途"的回答里抠出药名(进表/热词/pending 用)。
- * ⚠️ 没有换行 = 模型没按 prompt 的格式答 —— 返回空**故意不进表**:
- *    把整段用途当药名存进去(表里出现「盐酸氯环利嗪片是一种抗组胺药…」这种条目)
- *    比少采集一次糟得多, 而且会污染 ASR 热词表。 */
+/* 从"第一行药名 + 第二行用途"的回答里抠出药名(方案检查 / 添加引导用)。
+ * ⚠️ 没有换行 = 模型没按 prompt 的格式答 —— 返回空, 调用方**跳过方案检查**:
+ *    拿整段用途当药名去查表(「盐酸氯环利嗪片是一种抗组胺药…」这种串)毫无意义,
+ *    只会拼出一句莫名其妙的引导语。 */
 static std::string drugNameFromAnswer(const std::string &answer)
 {
     const size_t nl = answer.find('\n');
@@ -928,19 +904,18 @@ static void runCaptureAsk()
 
 #if !IS_TEST
         /* ---- 三分支处理(对应 ASK_PROMPT 的三种要求, 见其注释) ----
-         * 2026-10-11 改版: 拍照 = 「识药问答」——
-         *   药物   -> 播报"药名 + 用途"; 药名**默默**进表(不播报、不提示)
-         *   非药物 -> 播报"这不是药物哦，这是一个xxx", 不写任何数据
-         *   看不清 -> 提示重拍, 不写任何数据
-         * ⚠️ "该不该吃 / 录方案"从拍照播报里**拿掉了**, 改走语音查询/网页 ——
-         *    但药名仍然照旧进表: 语音匹配、ASR 热词表、"拍完说一天两次"
-         *    全都只认表里的名字, 这条链路一个字不能少。 */
+         * 2026-10-11 改版: 拍照 = 「普通识别」—— **只播报, 不写任何数据**
+         *   药物   -> 播报"药名 + 用途"; 不在用药方案里的追加一句添加引导
+         *   非药物 -> 播报"这不是药物哦，这是一个xxx"
+         *   看不清 -> 提示重拍
+         * ⚠️ 录入是**长按(说话)**那条路的事: 用户照引导说"药名一天两次",
+         *    medHandleUtterance 会添加新药。拍照路径不调 medAdd、不设任何状态。 */
 
-        /* 整段先过一遍形近字纠错(表见 kNameFix) —— 播报和进表都用纠正后的。
-           纠错前先打日志, 上机时靠这行确认这层在工作, 别去猜 */
+        /* 整段先过一遍形近字纠错(见 med.cpp 的 medFixDrugName) ——
+           播报和方案检查都用纠正后的。纠错前先打日志, 上机时靠这行确认这层在工作 */
         std::string answer = r.text;
         {
-            const std::string fixed = fixDrugName(answer);
+            const std::string fixed = medFixDrugName(answer);
             if (fixed != answer) {
                 ESP_LOGI(TAG, "[MED] 药名纠错: 「%s」->「%s」",
                               answer.c_str(), fixed.c_str());
@@ -949,7 +924,7 @@ static void runCaptureAsk()
         }
 
         std::string reply;               // 要上屏/播报的文本
-        bool        isDrug = false;      // 药物分支(决定写不写表、带不带免责)
+        bool        isDrug = false;      // 药物分支(决定带不带免责)
 
         if (strIndex(answer, "这不是药") >= 0) {
             /* ⚠️ 这一支必须排在"看不清"检测**之前** —— 老版本的失败短语表里
@@ -960,28 +935,40 @@ static void runCaptureAsk()
             reply = "没认出来是什么药, 换个角度或离近点再拍一张。";
             ESP_LOGI(TAG, "[MED] 拍照: 没看清");
         } else {
+            /* ---- 药物分支: "普通识别" —— 只播报, **不写任何数据** ----
+               分两种(按"这味药在不在用药方案里"):
+                 已在方案 -> 不啰嗦: 不念药名也不念用途, 直接回读一句方案(一天几次) ——
+                             常用药每次拍照都听一遍用途纯属啰嗦
+                 不在方案 -> 报"药名+用途", 再教用户怎么说才能添加(长按说话那条路,
+                             见 med.cpp 的 drugNameFromPlanPhrase) */
             isDrug = true;
             reply  = flattenLines(answer);
 
-            /* 第一行当药名(没换行 = 模型没按格式答 -> 不进表, 见 drugNameFromAnswer)。
-               ⚠️ 这一步是**语音那条路的前提**: 表空着的时候, 语音说
-                  「XX 一天两次」只会得到一句「还没记录任何药」。
-               ⚠️ 只在**不存在**时新增: medAdd 对已存在的药是"更新方案",
-                  直接调会把用户已经说好的「一天两次」冲成 0(靠短路求值保证)。 */
             const std::string drugName = cleanDrugName(drugNameFromAnswer(answer));
             if (drugName.empty()) {
-                ESP_LOGI(TAG, "[MED] 回答里没有可用的第一行药名, 本次不进表");
+                ESP_LOGI(TAG, "[MED] 回答里没有可用的第一行药名, 跳过方案检查");
             } else {
-                /* inTable = 这味药现在一定在表里(新加的, 或本来就有)。
-                   ⚠️ medAdd 失败(名字过长/表满/NVS 写失败)时是 false ——
-                      那种情况不设 pending: 药不在表里, 语音引导句会骗用户白说。 */
-                const bool inTable = (medFind(drugName.c_str()) >= 0) ||
-                                     medAdd(drugName.c_str(), 0, nullptr);
-
-                /* ★ 记住「刚拍的这味药」: 用户待会儿按住 BOOT 说「一天两次」时,
-                   那句话里没有药名, 靠它补全(见 med.h 的 medSetPendingDrug)。
-                   播报里**不提**这件事 —— 录方案完全由用户自己发起。 */
-                if (inTable) medSetPendingDrug(drugName.c_str());
+                /* 用 medUsage 而不是 medFind: "在方案里"的准确含义是
+                   "有记录**且设了次数**", perDay=0 的老条目也算没方案。 */
+                int pd = 0;
+                const bool inPlan = medUsage(drugName.c_str(), &pd, nullptr) && pd > 0;
+                if (inPlan) {
+                    reply = "这个药在你的用药方案里，一天 " + std::to_string(pd) + " 次。";
+                    /* ⚠️ 回读设备自己存的方案 ≠ 医学建议 —— 不带免责。
+                       (带的话这句"不啰嗦"的短句又被免责拖长, 而且和"已记下这次
+                       服用"那类记录回读一个道理, 免责只对用药提醒有意义) */
+                    isDrug = false;
+                    ESP_LOGI(TAG, "[MED] 拍照: %s 已在方案 (一天 %d 次), 短播报",
+                                  drugName.c_str(), pd);
+                } else {
+                    /* 保证句读衔接: 模型偶尔不写句末标点, 直接拼会连读 */
+                    if (reply.size() < 3 || reply.compare(reply.size() - 3, 3, "。") != 0)
+                        reply += "。";
+                    reply += "这个药不在你的用药方案，如果要添加，按住按钮说：" +
+                             drugName + "一天两次。";
+                    ESP_LOGI(TAG, "[MED] 拍照: %s 不在用药方案, 已附添加引导",
+                                  drugName.c_str());
+                }
             }
         }
 

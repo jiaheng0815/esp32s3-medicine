@@ -111,7 +111,11 @@ bool voiceSpeakAsync(const char *text, bool addDisclaimer = false);
 
 /* 定长数组 + 临界区拷贝 —— 语音 task 写、主线程读, 用 String 跨任务传不安全 */
 #define VOICE_TEXT_MAX    256
-#define VOICE_REPLY_MAX   400
+/* 400 -> 512(2026-10-11): reply 要装下最长的一档播报(药名+用途+添加引导
+   ≈ 120 字 = 360 字节), 400 太贴边。
+   ⚠️ 它同时是 voiceSpeakAsync 的入队缓冲(s_pending 同尺寸) —— 这层小了,
+   文本进语音 task 之前就被截了, TTS 那边缓冲开多大都救不回来。 */
+#define VOICE_REPLY_MAX   512
 
 struct VoiceResult {
     bool     ok;
