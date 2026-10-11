@@ -1,12 +1,4 @@
 # PlatformIO 构建产物
 .pio/
-
-# 含 API Key, 绝不入库
-src/secrets.h
-
-演示稿.md
-
-# 固件备份 —— 完整 flash 镜像, 含 WiFi 凭据和药品数据, 绝不入库
-backup/
-
-build_bak/
+.vscode/
+CLAUDE.md

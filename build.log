@@ -1,5 +1,0 @@
-Processing esp32s3cam (platform: https://github.com/pioarduino/platform-espressif32/releases/download/55.03.312-1/platform-espressif32.zip; board: esp32-s3-devkitc-1; framework: arduino)
---------------------------------------------------------------------------------
-Tool Manager: Installing https://github.com/espressif/arduino-esp32/releases/download/3.3.12/esp32-core-3.3.12-libs.tar.xz
-Downloading 0% 10% 20% 30% 40% 50% 60% 70% 80% 90% 100%
-Unpacking 0% 10%
