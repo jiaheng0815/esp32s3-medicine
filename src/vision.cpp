@@ -133,18 +133,19 @@ static const char *TAG = "vision";    // 日志标签
 #define ZHIPU_HOST      "open.bigmodel.cn"
 #define ZHIPU_PATH      "/api/paas/v4/chat/completions"
 
-/* 模型 ID。两个选择:
- *   "glm-4.6v"         106B 基础版, 准确率高得多 (30+ 基准同规模 SOTA),
- *                      收费但极便宜: 输入 1 元/输出 3 元每百万 token,
- *                      一张图 + 一句话答案大约 0.002 元, 1000 次才一块多
- *   "glm-4.6v-flash"   9B 轻量版, 免费, 但小目标/细节容易认错
- * 认不准就先换成 "glm-4.6v" 试试 —— 这是性价比最高的一步。 */
-#define ZHIPU_MODEL     "glm-4.6v"
+/* 模型 ID(2026-10-11 定): "glm-5v-turbo" —— 识图(拍照)链路用强模型。
+ * 实测(同一张药盒实拍图): 药名读得准, 关掉思考后 2~9 秒出答案(首次 25 秒是冷启动)。
+ * (备选 "glm-5.3-flash": 更轻, 但它是**始终思考**模型、关不掉(见下),
+ *  ~6 秒; 留给以后可能加的纯问答场景, 这条链路暂时不用它。) */
+#define ZHIPU_MODEL     "glm-5v-turbo"
 
-/* GLM-4.6V 是推理模型: 默认会先吐一大段 thinking(reasoning_content) 再给答案。
- * 关掉它, 回答又快又直接, 也省配额。
- * 万一这个模型不认 thinking 参数, API 会回 HTTP 400 —— 那就把这里改成 0。 */
-#define DISABLE_THINKING  1
+/* 思考参数 —— ⚠️ 各模型写法**完全不同**, 换模型时必须一起改, 否则 API 直接 400:
+ *   glm-5v-turbo    支持 "thinking":{"type":"disabled"} 关掉 —— 实测思考 0 字符, 2~9 秒
+ *   glm-5.3-flash   **关不掉**, 发 disabled 会 400(「该模型始终思考，不支持关闭思考；
+ *                   请使用 low、high 或 max」), 只能 "reasoning_effort":"low" —— 6~7 秒
+ * 两种写法的**字段名都不一样**(thinking vs reasoning_effort), 所以直接存完整
+ * JSON 片段, 比存值清楚。"" = 不附加任何字段(用模型默认, 最慢的那档)。 */
+#define MODEL_EXTRA_PARAMS  ",\"thinking\":{\"type\":\"disabled\"}"
 
 /* 上传诊断探针: 拍完照后, 把同一张图的 base64 先发一份到 postman-echo.com
    (先小包证明可达, 再大包), 用来区分「设备发不了大包」和「只对这个接口卡」。
@@ -155,8 +156,9 @@ static const char *TAG = "vision";    // 日志标签
 /* max_tokens 要给「思考 + 答案」留够空间。
  * 之前设 64 就是踩了这个坑: 思考过程把那点额度吃光, content 一个字没轮上,
  * 响应里 finish_reason 是 "length"、content 是空字符串。
- * 关掉思考后 1024 绰绰有余; 就算思考没关掉, 这个值也够它想完再答。 */
-#define SHOT_MAX_TOKENS   1024
+ * 当前模型 glm-5v-turbo 关掉思考后回答很短(药名/用途一两句), 2048 实测
+ * finish_reason=stop 收尾干净; 就算哪天把思考又打开, 这个量也够它想完再答。 */
+#define SHOT_MAX_TOKENS   2048
 
 #define TLS_TIMEOUT_S   15            // WiFiClientSecure 的 setTimeout 单位是「秒」
 
@@ -592,9 +594,8 @@ VisionResult visionCaptureAndAsk(const char *prompt, VisionStageCb cb)
     std::string suffix =
         std::string("\"}},{\"type\":\"text\",\"text\":\"") + httpJsonEscape(prompt) +
         "\"}]}],\"max_tokens\":" + std::to_string(SHOT_MAX_TOKENS) + ",\"temperature\":0.1";
-#if DISABLE_THINKING
-    suffix += ",\"thinking\":{\"type\":\"disabled\"}";
-#endif
+    /* 思考参数: 各模型写法不同, 见 MODEL_EXTRA_PARAMS 的注释 */
+    suffix += MODEL_EXTRA_PARAMS;
     suffix += "}";
     const size_t bodyLen = prefix.size() + b64Len + suffix.size();
 

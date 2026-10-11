@@ -6,7 +6,9 @@
  *         --(2x2 平均降采样)--> 160x120 --> ST7735S (SPI, 批量32bit发送)
  *
  * 按键 (板上 BOOT = GPIO0):
- *   短按        -> 拍照发给智谱认药名, 本地算该不该吃, 喇叭读出来
+ *   短按        -> 拍照发给智谱「识药问答」: 是药就报药名+用途,
+ *                  不是药就说明"这是一个xxx", 喇叭读出来
+ *                  ("该不该吃"和录方案改走语音/网页, 见 runCaptureAsk)
  *   按住 1.2 秒 -> 对着麦克风说话, 松手后上传智谱做语音转文字,
  *                  走「和网页文本框同一条」本地处理链路, 结果也读出来
  *   双击        -> 进配网模式 (开热点 ESP32-CAM-Setup), 随时可重配
@@ -46,6 +48,7 @@
 #include "esp_heap_caps.h"
 #include "pins.h"
 #include "netcfg.h"
+#include "strutil.h"    // strIndex / strTrim 等 std::string 小工具
 #include "vision.h"
 #include "med.h"
 #include "webui.h"
@@ -766,28 +769,36 @@ static void drawVoiceResult(const char *heard, const char *reply)
 static const char ASK_PROMPT[] =
     "这是什么？用一句中文直接回答，不超过20字，不要客套和多余解释。";
 #else
-/* 正常模式: 只认药名 —— 问得越窄, 回答越短, token 越省, 也好做本地匹配。
+/* 正常模式(2026-10-11 改版): 「识药问答」——
+ *   是药   -> 第一行药名 + 第二行用途; 设备端取第一行做药名(进表/热词), 整段播报
+ *   不是药 -> "这不是药物哦，这是一个xxx"(设备端靠"这不是药"分流)
+ *   看不清 -> 只答"看不清"(设备端提示重拍)
+ * PC 实测(glm-5.3-flash, 药图 3 次 / 非药图 2 次 / 模糊图 1 次): 三个分支都稳定服从。
  *
- * ⚠️ 2026-10-11 加强(现场倒装拍摄): 提示词里点明"可能倾斜/倒置、逐字辨认、
- *    注意形近字"。PC 对照实验(见 CLAUDE.md 坑 #19): 倒置图上这层只把
- *    "3 次全错"缓成"1/3 对"—— 主力是 SHOT_ROT180 把图转正, 这层是兜底;
- *    图转正后加上它稳定不劣化。形近字的例子写「氯/氟」, 就是实测认错的那对。 */
+ * ⚠️「第一行只写药品名称」是给设备端**提取药名**用的 —— 改 prompt 时这句别丢,
+ *    丢了 drugNameFromAnswer() 就永远拿到空串(也就是不再进表/pending)。
+ * ⚠️「注意区分字形相近的字」是坑 #19 的兜底(主力是 SHOT_ROT180 把图转正);
+ *    「看清不」那条也要留 —— 没它模型会对糊图硬猜(实测: 糊图精确回"看不清")。 */
 static const char ASK_PROMPT[] =
-    "这是什么药？只回答药品的名称，不要剂量、用途、厂家或任何其他内容。"
-    "照片可能倾斜、倒置或光线不好，请逐字仔细辨认包装上的药名，"
-    "注意区分字形相近的字（如“氯”和“氟”），不要凭印象猜测。"
-    "如果包装上的药名看不清或不确定，只回答三个字：看不清。";
+    "这是什么？如果是药品，第一行只写药品名称（不要任何标点、符号或别的字，"
+    "注意区分字形相近的字，如“氯”和“氟”），第二行用一两句话说明它的用途。"
+    "如果不是药品，只回答「这不是药物哦，这是一个xxx」，xxx换成实际是什么。"
+    "如果图像模糊看不清，只回答：看不清。";
 #endif
 
 /* 这两个是「拍照第二阶段」专用的 —— 用它的地方在 #if !IS_TEST 里,
    所以自己也得跟着关, 否则 TEST 模式下就是两个没人用的 static(编译器会嚷)。 */
 #if !IS_TEST
-/* 模型答的不是药名时(「看不清」「无法确定」...)别往 medAdvice 里送。
- * 那条路会回一句「看不清: 还没录入用药方案」—— 把"没认出来"说成"没录入",
- * 用户照着去录入一条名叫"看不清"的药就更糟了。 */
+/* 模型没看清时的失败回答("看不清"/"无法确定"...) —— 不写任何数据, 提示重拍。
+ * ⚠️ 只在**短回答**上判断: 「模糊」这类词也可能出现在用途描述里(有些药的副作用
+ *    就是"视物模糊"), 长句里出现不算失败。prompt 要求看不清时精确回"看不清",
+ *    这里的长度限制是防模型自由发挥的兜底。
+ * ⚠️ "不是药"不在这里 —— 那是「这不是药物哦」分流的关键词, 判在更前面,
+ *    两个判断的先后顺序别调换(见 runCaptureAsk 里的注释)。 */
 static bool looksLikeNotADrug(const std::string &t)
 {
-    static const char *kNo[] = { "看不清", "不清楚", "不确定", "无法", "模糊", "不是药" };
+    if (t.length() > 20) return false;      // 6~7 个汉字以内才可能是失败短语
+    static const char *kNo[] = { "看不清", "不清楚", "不确定", "无法", "模糊" };
     for (size_t i = 0; i < sizeof(kNo) / sizeof(kNo[0]); i++) {
         if (t.find(kNo[i]) != std::string::npos) return true;
     }
@@ -822,8 +833,10 @@ static std::string cleanDrugName(const std::string &raw)
         }
     }
 
-    /* 剥前缀。⚠️ 按字节长度比, 前缀都在开头且是完整的 UTF-8 序列, 不会切坏字符 */
-    static const char *kHead[] = { "这是", "这个药是", "这药是", "答：", "答:" };
+    /* 剥前缀。⚠️ 按字节长度比, 前缀都在开头且是完整的 UTF-8 序列, 不会切坏字符。
+       ("药品名称："是识药问答的模型偶尔会带的标签 —— 实测 3/3 时不带, 这里是防漏) */
+    static const char *kHead[] = { "这是", "这个药是", "这药是", "答：", "答:",
+                                   "药品名称：", "药品名称:" };
     for (size_t i = 0; i < sizeof(kHead) / sizeof(kHead[0]); i++) {
         const std::string h = kHead[i];
         if (s.size() > h.size() && s.compare(0, h.size(), h) == 0) {
@@ -860,6 +873,42 @@ static std::string fixDrugName(const std::string &s)
     }
     return out;
 }
+
+/* 从"第一行药名 + 第二行用途"的回答里抠出药名(进表/热词/pending 用)。
+ * ⚠️ 没有换行 = 模型没按 prompt 的格式答 —— 返回空**故意不进表**:
+ *    把整段用途当药名存进去(表里出现「盐酸氯环利嗪片是一种抗组胺药…」这种条目)
+ *    比少采集一次糟得多, 而且会污染 ASR 热词表。 */
+static std::string drugNameFromAnswer(const std::string &answer)
+{
+    const size_t nl = answer.find('\n');
+    if (nl == std::string::npos) return "";
+
+    std::string first = answer.substr(0, nl);
+    strTrim(first);                         // 去首尾空白/\r
+    return first;
+}
+
+/* 换行 -> "。" : TTS 停顿自然("药名。用途…"), 屏幕上也不会出现断行空隙
+   (cnDrawWrapped 会把 '\n' 当普通 ASCII 字符画出一个 8px 空档)。
+   连续多个换行算一个句读。 */
+static std::string flattenLines(const std::string &s)
+{
+    std::string out;
+    out.reserve(s.size() + 4);
+    for (size_t i = 0; i < s.size(); ) {
+        if (s[i] == '\n' || s[i] == '\r') {
+            while (i < s.size() && (s[i] == '\n' || s[i] == '\r')) i++;
+            /* 上行已带句末标点时不再补(防"。。") —— 药名行按 prompt 不带标点,
+               这里只是兜底 */
+            const bool hasEnd = out.size() >= 3 &&
+                                out.compare(out.size() - 3, 3, "。") == 0;
+            if (!hasEnd) out += "。";
+        } else {
+            out += s[i++];
+        }
+    }
+    return out;
+}
 #endif  /* !IS_TEST */
 
 static void runCaptureAsk()
@@ -867,7 +916,7 @@ static void runCaptureAsk()
 #if IS_TEST
     ESP_LOGI(TAG, "\n[KEY] 短按 -> 拍照识图 (TEST 模式)");
 #else
-    ESP_LOGI(TAG, "\n[KEY] 短按 -> 拍照识别药品");
+    ESP_LOGI(TAG, "\n[KEY] 短按 -> 拍照识药问答 (药名+用途 / 非药物说明)");
 #endif
 
     const VisionResult r = visionCaptureAndAsk(ASK_PROMPT, onVisionStage);
@@ -878,57 +927,78 @@ static void runCaptureAsk()
         ESP_LOGI(TAG, "==============================");
 
 #if !IS_TEST
-        /* 第二阶段: 本地查记忆、本地算时间 —— 纯本地, 不调 API */
+        /* ---- 三分支处理(对应 ASK_PROMPT 的三种要求, 见其注释) ----
+         * 2026-10-11 改版: 拍照 = 「识药问答」——
+         *   药物   -> 播报"药名 + 用途"; 药名**默默**进表(不播报、不提示)
+         *   非药物 -> 播报"这不是药物哦，这是一个xxx", 不写任何数据
+         *   看不清 -> 提示重拍, 不写任何数据
+         * ⚠️ "该不该吃 / 录方案"从拍照播报里**拿掉了**, 改走语音查询/网页 ——
+         *    但药名仍然照旧进表: 语音匹配、ASR 热词表、"拍完说一天两次"
+         *    全都只认表里的名字, 这条链路一个字不能少。 */
 
-        /* 认出来了就顺手把药名记进药品表(perDay=0 = 只有名字, 方案等用户说)。
-           ⚠️ 这一步是**语音那条路的前提**: 药名匹配和 ASR 热词表都只认表里的名字,
-           而拍照是唯一能把药名自动"采"进表里的入口 —— 表空着的时候,
-           语音说「XX 一天两次」只会得到一句「还没记录任何药」。
-           ⚠️ 只在**不存在**时新增: medAdd 对已存在的药是"更新方案",
-           直接调会把用户已经说好的「一天两次」冲成 0(靠短路求值保证)。 */
-        std::string drugName = looksLikeNotADrug(r.text) ? std::string()
-                                                         : cleanDrugName(r.text);
-
-        /* 形近字纠错(表见 kNameFix)。纠错前先打日志 —— 上机时靠这行确认
-           这层到底有没有在工作, 别去猜 */
+        /* 整段先过一遍形近字纠错(表见 kNameFix) —— 播报和进表都用纠正后的。
+           纠错前先打日志, 上机时靠这行确认这层在工作, 别去猜 */
+        std::string answer = r.text;
         {
-            const std::string fixed = fixDrugName(drugName);
-            if (fixed != drugName) {
+            const std::string fixed = fixDrugName(answer);
+            if (fixed != answer) {
                 ESP_LOGI(TAG, "[MED] 药名纠错: 「%s」->「%s」",
-                              drugName.c_str(), fixed.c_str());
-                drugName = fixed;
+                              answer.c_str(), fixed.c_str());
+                answer = fixed;
             }
         }
 
-        if (!drugName.empty()) {
-            /* inTable = 这味药现在一定在表里(新加的, 或本来就有)。
-               ⚠️ medAdd 失败(名字过长/表满/NVS 写失败)时是 false —— 那种情况
-                  不设 pending: 药不在表里, 引导句「说一句一天两次」会骗用户白说。 */
-            const bool inTable = (medFind(drugName.c_str()) >= 0) ||
-                                 medAdd(drugName.c_str(), 0, nullptr);
+        std::string reply;               // 要上屏/播报的文本
+        bool        isDrug = false;      // 药物分支(决定写不写表、带不带免责)
 
-            /* ★ 记住「刚拍的这味药」: 用户待会儿按住 BOOT 说「一天两次」时,
-               那句话里没有药名, 靠它补全(见 med.h 的 medSetPendingDrug)。
-               拍照没认出药名时不调用 —— 上一次的机会保留。 */
-            if (inTable) medSetPendingDrug(drugName.c_str());
+        if (strIndex(answer, "这不是药") >= 0) {
+            /* ⚠️ 这一支必须排在"看不清"检测**之前** —— 老版本的失败短语表里
+               有"不是药", 顺序反了会把"这不是药物哦"当成"没认出来" */
+            reply = flattenLines(answer);
+            ESP_LOGI(TAG, "[MED] 拍照: 非药物");
+        } else if (looksLikeNotADrug(answer)) {
+            reply = "没认出来是什么药, 换个角度或离近点再拍一张。";
+            ESP_LOGI(TAG, "[MED] 拍照: 没看清");
+        } else {
+            isDrug = true;
+            reply  = flattenLines(answer);
+
+            /* 第一行当药名(没换行 = 模型没按格式答 -> 不进表, 见 drugNameFromAnswer)。
+               ⚠️ 这一步是**语音那条路的前提**: 表空着的时候, 语音说
+                  「XX 一天两次」只会得到一句「还没记录任何药」。
+               ⚠️ 只在**不存在**时新增: medAdd 对已存在的药是"更新方案",
+                  直接调会把用户已经说好的「一天两次」冲成 0(靠短路求值保证)。 */
+            const std::string drugName = cleanDrugName(drugNameFromAnswer(answer));
+            if (drugName.empty()) {
+                ESP_LOGI(TAG, "[MED] 回答里没有可用的第一行药名, 本次不进表");
+            } else {
+                /* inTable = 这味药现在一定在表里(新加的, 或本来就有)。
+                   ⚠️ medAdd 失败(名字过长/表满/NVS 写失败)时是 false ——
+                      那种情况不设 pending: 药不在表里, 语音引导句会骗用户白说。 */
+                const bool inTable = (medFind(drugName.c_str()) >= 0) ||
+                                     medAdd(drugName.c_str(), 0, nullptr);
+
+                /* ★ 记住「刚拍的这味药」: 用户待会儿按住 BOOT 说「一天两次」时,
+                   那句话里没有药名, 靠它补全(见 med.h 的 medSetPendingDrug)。
+                   播报里**不提**这件事 —— 录方案完全由用户自己发起。 */
+                if (inTable) medSetPendingDrug(drugName.c_str());
+            }
         }
 
-        const std::string advice = drugName.empty()
-            ? std::string("没认出来是什么药, 换个角度或离近点再拍一张。")
-            : medAdvice(drugName.c_str());
-        ESP_LOGI(TAG, "\n========== 用药提醒 ==========");
-        ESP_LOGI(TAG, "%s", advice.c_str());
-        ESP_LOGI(TAG, "==============================");
+        ESP_LOGI(TAG, "\n========== 播报 ==========");
+        ESP_LOGI(TAG, "%s", reply.c_str());
+        ESP_LOGI(TAG, "==========================");
 
-        /* 药名和结论都上屏 —— cnfont 有中文点阵, 不用只靠串口 */
-        drawVoiceResult(r.text.c_str(), advice.c_str());
+        /* 上屏 —— cnfont 有中文点阵, 不用只靠串口。
+           reply 里的换行已在 flattenLines 里换成句号, 屏幕上不会出现断行空隙 */
+        drawVoiceResult("", reply.c_str());
         delay(1500);                    // 让人看一眼再被别的提示盖掉
 
-        /* 读出来。拍照比说话简单得多, 所以这条路径对不方便看屏幕的人
-           才是主路径 —— 拍一下就知道该不该吃。
+        /* 读出来。拍照比说话简单得多, 所以这条路径对不方便看屏幕的人才是主路径。
            走异步: 同步播的话这几秒里 webuiLoop() 停摆, 手机打不开网页,
-           而结论恰恰要显示在网页上。 */
-        voiceSpeakAsync(advice.c_str(), true);      // 用药结论, 带免责
+           而结果恰恰要显示在网页上。
+           免责只给药物分支("用途"是用药信息该带); "这是一个壁纸"带免责就离谱了 */
+        voiceSpeakAsync(reply.c_str(), isDrug);
 #else
         showStatus("See serial", nullptr);
 #endif
